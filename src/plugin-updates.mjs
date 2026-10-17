@@ -1,0 +1,306 @@
+import { readFile, stat, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import { parse as parseYaml } from 'yaml';
+import { withFileLock, writeFileAtomic } from '@deepseek-ai/dsh-atomic-write';
+import { writePrivateJson } from './config.mjs';
+import { outsideActivation } from './plugin-reload.mjs';
+import { parseWorkBuddyVersion, compareWorkBuddyVersions } from '../upstream/workbuddy/src/update.ts';
+
+const packageName = /^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i;
+const safeRef = /^[a-zA-Z0-9._/-]{1,200}$/;
+export function parsePluginSource(name, spec) {
+  if (!packageName.test(name) || typeof spec !== 'string' || spec.length > 600 || spec.startsWith('-') || spec.trim() !== spec || /[\x00-\x1f]/.test(spec)) return { kind: 'unsupported' };
+  const git = /^(?:github:|git\+https:\/\/github\.com\/|https:\/\/github\.com\/|git\+ssh:\/\/git@github\.com\/|git@github\.com:)?([\w.-]+)\/([\w.-]+?)(?:\.git)?(?:#(.+))?$/.exec(spec);
+  if (git && !spec.startsWith('@') && !spec.startsWith('file:') && !spec.startsWith('link:')) {
+    const [, owner, repo, ref] = git;
+    if (owner === '.' || owner === '..' || repo === '.' || repo === '..' || (ref && (!safeRef.test(ref) || ref.includes('..')))) return { kind: 'unsupported' };
+    return { kind: 'github', owner, repo, ref, source: `github:${owner}/${repo}${ref ? '#' + ref : ''}` };
+  }
+  if (/^(?:file:|link:|workspace:|https?:|git|\/|\.)/.test(spec)) return { kind: 'unsupported' };
+  const alias = /^npm:((?:@[^/]+\/)?[^@]+)(?:@(.+))?$/.exec(spec);
+  const actual = alias?.[1] ?? name, range = alias?.[2] ?? spec;
+  if (!packageName.test(actual) || !/^[a-zA-Z0-9.*^~<>=|+ -]{1,160}$/.test(range)) return { kind: 'unsupported' };
+  // Explicit dist-tags retain their channel; exact versions and ranges update to latest.
+  const channel = /^[a-zA-Z][\w.-]*$/.test(range);
+  return { kind: 'npm', package: actual, alias: !!alias, channel, tag: channel ? range : 'latest', source: spec };
+}
+export function githubCommit(value) {
+  if (typeof value !== 'string') return undefined;
+  return /(?:\/tar\.gz\/|\/tarball\/|#)([a-f0-9]{40})(?:\b|\()/i.exec(value)?.[1]?.toLowerCase();
+}
+async function jsonFile(file) { try { return JSON.parse(await readFile(file, 'utf8')); } catch { return undefined; } }
+async function locks(dir) {
+  let pnpm;
+  try { pnpm = parseYaml(await readFile(join(dir, 'pnpm-lock.yaml'), 'utf8'), { maxAliasCount: 20 }); } catch { /* npm profiles use package-lock instead. */ }
+  const npm = await jsonFile(join(dir, 'package-lock.json'));
+  const times = await Promise.all(['pnpm-lock.yaml', 'package-lock.json'].map(name => stat(join(dir, name)).then(s => s.mtimeMs).catch(() => 0)));
+  return { pnpm, npm, preferNpm: times[1] > times[0] };
+}
+async function publicJson(url, fetchImpl, signal) {
+  const res = await fetchImpl(url, { signal: AbortSignal.any([signal, AbortSignal.timeout(12000)]),
+    // Request only the SHA: the default JSON includes file patches and can be megabytes.
+    headers: { Accept: 'application/vnd.github.sha', 'User-Agent': 'dsh-multi-router-plugin-updates' }, redirect: 'error' });
+  if (!res.ok) throw Error(res.status === 403 || res.status === 429 ? '远端限流，请稍后重试' : res.status === 404 ? '仓库 / 版本不存在，或需要私有仓库授权' : `网络请求失败（HTTP ${res.status}）`);
+  let size = 0, chunks = [];
+  for await (const chunk of res.body) { size += chunk.byteLength; if (size > 256 * 1024) throw Error('更新元数据过大'); chunks.push(Buffer.from(chunk)); }
+  const text = Buffer.concat(chunks).toString('utf8').trim();
+  return /^[a-f0-9]{40}$/i.test(text) ? { sha: text } : JSON.parse(text);
+}
+const short = sha => sha?.slice(0, 8);
+const installFailed = r => !!(r.error || ['failed', 'cancelled'].includes(r.application) || r.packageResult && r.packageResult.exitCode !== 0);
+function installFailure(result) {
+  // Inspect locally; never send package-manager output, user paths or tokens to the panel.
+  const text = [result.error?.diagnostic, result.packageResult?.output, result.packageResult?.kind].filter(v => typeof v === 'string').join('\n');
+  let reason = 'unknown', message = '安装未完成；请在 DSH 原生插件页查看安装日志，或复制下方诊断信息。';
+  if (result.application === 'cancelled') { reason = 'cancelled'; message = '安装已取消，可重新检查后重试。'; }
+  else if (/ERR_PNPM_(?:MINIMUM_RELEASE_AGE_VIOLATION|NO_MATURE_MATCHING_VERSION)|minimumReleaseAge/i.test(text)) { reason = 'release-age'; message = '新版本尚在安装器的新包等待期内。输入包名可能选中旧版，指定新版本可能被拒绝；请等待策略规定的时间后重试，或由用户明确为该版本设置例外。换镜像或重启不会解除此限制。'; }
+  else if (result.pendingBuilds?.length) { reason = 'build'; message = '依赖构建脚本需要授权，请到 DSH 插件安装页允许这些脚本后重试。'; }
+  else if (result.error?.code === 'incompatible-version') { reason = 'compatibility'; message = '插件与当前 DSH 不兼容，请先升级 DSH 或选择兼容版本。'; }
+  else if (/\b(?:EPERM|EBUSY|EACCES)\b|resource busy|file.*(?:locked|in use)/i.test(text)) { reason = 'files'; message = '插件文件被占用或目录权限不足，安装未完成。请先在 DSH 停用该插件后重试，并检查安装目录权限；仍被占用时需退出托盘应用。'; }
+  else if (/HMR transactions cannot be nested|activation|did not activate|entry.*activate/i.test(text)) { reason = 'activation'; message = '插件加载失败。请检查 DSH 插件页的组件错误，再关闭并重新启用；安装与加载是两个独立步骤。'; }
+  else if (result.packageResult?.timedOut || /\b(?:ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED)\b|network|fetch|download/i.test(text)) { reason = 'network'; message = '插件下载或网络请求失败，安装未完成。npm 来源可切换到「npm 官方」后重试；GitHub 来源请检查 GitHub 网络连接。'; }
+  const code = /\b(?:ERR_PNPM_MINIMUM_RELEASE_AGE_VIOLATION|ERR_PNPM_NO_MATURE_MATCHING_VERSION|EPERM|EBUSY|EACCES|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|ECONNREFUSED)\b/.exec(text)?.[0]
+    ?? (['operation-error', 'incompatible-version'].includes(result.error?.code) ? result.error.code : 'unknown');
+  return { status: 'failed', application: result.application, message, diagnostic: {
+    reason, code, platform: process.platform, stage: reason === 'activation' ? 'activation' : 'install',
+    ...(Number.isInteger(result.packageResult?.exitCode) ? { exitCode: result.packageResult.exitCode } : {}),
+  } };
+}
+async function registryVersion(service, profile, spec, signal, requestedRegistry) {
+  const require = createRequire(profile.installAnchor);
+  const { viewProfilePackage } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-plugin-manager/operations')).href);
+  const { registryPlan } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-plugin-manager/registry')).href);
+  for (const registry of registryPlan(requestedRegistry, await service.registries())) {
+    const answer = await viewProfilePackage(profile.dir, spec, { ...profile.packageManager, registry, timeoutMs: 12000, signal });
+    if (signal.aborted) throw Error('检查已取消');
+    if (answer.exitCode !== 0) continue;
+    const parsed = JSON.parse(answer.stdout), metadata = Array.isArray(parsed) ? parsed.at(-1) : parsed;
+    if (metadata?.version) return metadata;
+  }
+  throw Error('npm 查询失败；请检查 DSH 网络、registry 设置或包的访问权限');
+}
+async function refreshGitPlugin(service, profile, row, options, signal) {
+  const require = createRequire(profile.installAnchor);
+  const { runProfilePnpm } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-plugin-manager/operations')).href);
+  const { registryPlan, attributeFailure } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-plugin-manager/registry')).href);
+  const { classifyInstallFailure } = await import(pathToFileURL(require.resolve('@deepseek-ai/dsh-plugin-manager')).href);
+  const plan = registryPlan(options.registry, await service.registries());
+  return withFileLock(join(profile.dir, 'package.json'), async () => {
+    const files = await Promise.all(['package.json', 'pnpm-lock.yaml'].map(async name => {
+      const path = join(profile.dir, name);
+      try { return { path, content: await readFile(path, 'utf8') }; } catch (e) { if (e.code !== 'ENOENT') throw e; return { path }; }
+    }));
+    const restore = () => Promise.all(files.map(f => f.content === undefined ? rm(f.path, { force: true }) : writeFileAtomic(f.path, f.content, { mode: 0o600 })));
+    if (JSON.parse(files[0].content).dependencies?.[row.name] !== row.spec) throw Error('安装来源已改变，请重新检查');
+    let result;
+    try {
+      for (const registry of plan) {
+        signal.throwIfAborted();
+        // pnpm add reuses an unchanged Git lock; update explicitly refreshes its tracked ref.
+        const run = await runProfilePnpm({ ...profile, profile: profile.name }, ['update', row.name, ...(registry ? [`--registry=${registry}`] : [])], {
+          execution: 'service', ...profile.packageManager, signal, outputBytes: 16384, idleTimeoutMs: 600000,
+          lookupTimeoutMs: 20000, activateNewBundles: false,
+        });
+        if (run.exitCode === 0 && !run.timedOut && !signal.aborted) return { packageResult: run, application: 'restart-required' };
+        const kind = classifyInstallFailure({ log: run.output, timedOut: run.timedOut });
+        result = { packageResult: { ...run, kind }, application: signal.aborted ? 'cancelled' : 'failed',
+          ...(run.incompatible?.length ? { error: { code: 'incompatible-version' } } : {}) };
+        await restore();
+        if (signal.aborted || attributeFailure(kind, run.output, { kind: 'git', host: 'github.com' }) !== 'registry') break;
+      }
+      return result;
+    } catch (e) { await restore(); throw e; }
+  }, { waitMs: 120000 });
+}
+export class PluginUpdates {
+  constructor({ service = () => undefined, profile = () => undefined, hmr = () => undefined, fetchImpl = (...args) => fetch(...args), lookup = registryVersion, refreshGit = refreshGitPlugin, onInstalled, stateFile, now = Date.now } = {}) {
+    this.stateFile = stateFile; this.now = now; this.dismissed = {}; this.lastAttempt = 0; this.saveQueue = Promise.resolve();
+    this.service = service; this.profile = profile; this.hmr = hmr; this.fetchImpl = fetchImpl;
+    this.rows = []; this.abort = new AbortController();
+    this.lookup = lookup;
+    this.refreshGit = refreshGit;
+    this.onInstalled = onInstalled;
+  }
+  async load() {
+    const saved = this.stateFile && await jsonFile(this.stateFile);
+    if (saved?.version === 1) { this.lastAttempt = Number.isFinite(saved.lastAttempt) ? saved.lastAttempt : 0; this.checkedAt = saved.checkedAt; this.dismissed = saved.dismissed && typeof saved.dismissed === 'object' && !Array.isArray(saved.dismissed) ? saved.dismissed : {}; this.rows = Array.isArray(saved.rows) ? saved.rows.filter(r => ['github', 'npm'].includes(r.source?.kind)) : []; }
+  }
+  persist() {
+    if (!this.stateFile) return Promise.resolve();
+    const saved = structuredClone({ version: 1, lastAttempt: this.lastAttempt, checkedAt: this.checkedAt, dismissed: this.dismissed, rows: this.rows.filter(r => ['github', 'npm'].includes(r.source.kind)) });
+    this.saveQueue = this.saveQueue.catch(() => {}).then(() => writePrivateJson(this.stateFile, saved)); return this.saveQueue;
+  }
+  reminderKey(row) { return JSON.stringify([row.name, row.source, row.version, row.latestVersion ?? row.latestCommit]); }
+  reminders() { return this.rows.filter(r => r.status === 'available' && (!Object.hasOwn(this.dismissed, r.name) || this.dismissed[r.name] !== this.reminderKey(r))).map(r => ({ key: this.reminderKey(r), name: r.name, version: r.version, latestVersion: r.latestVersion, latestCommit: r.latestCommit })); }
+  async dismiss(keys) {
+    if (!Array.isArray(keys) || keys.length > 200 || keys.some(k => typeof k !== 'string')) throw Error('无效的提醒列表');
+    for (const row of this.reminders()) if (keys.includes(row.key)) Object.defineProperty(this.dismissed, row.name, { value: row.key, enumerable: true, configurable: true, writable: true });
+    await this.persist();
+  }
+  async tick() {
+    if (this.flight || !this.state().available) return;
+    // Revalidate cached notices against the local installed inventory, including
+    // removals and updates made through DSH or another plugin manager.
+    await this.list();
+    if (this.abort.signal.aborted) return;
+    if (this.flight || this.now() >= this.lastAttempt && this.now() - this.lastAttempt < 86400000) return;
+    // Reserve before I/O: minute ticks and restarts cannot hammer failed sources.
+    this.lastAttempt = this.now(); await this.persist();
+    if (!this.flight && !this.abort.signal.aborted) this.check();
+  }
+  state() { return { available: !!this.service()?.listBundles && !!this.profile()?.dir,
+    checkedAt: this.checkedAt, reminders: this.reminders(), autoCheckHours: 24, rows: this.rows.map(({ spec, ...row }) => ({ ...row, source: row.source.kind === 'unsupported' ? { kind: 'unsupported' } : row.source })), job: this.job, error: this.error }; }
+  async list() {
+    const service = this.service(), profile = this.profile();
+    if (!service?.listBundles || !profile?.dir) { this.rows = []; return; }
+    const [manifest, bundles, lock] = await Promise.all([jsonFile(join(profile.dir, 'package.json')), service.listBundles(), locks(profile.dir)]);
+    if (!manifest) throw Error('当前 DSH 配置的插件清单无法读取');
+    this.rows = bundles.filter(b => (b.installed || b.version) && manifest.dependencies?.[b.name]
+      && b.removable !== false).map(b => {
+      const spec = manifest.dependencies?.[b.name];
+      const source = parsePluginSource(b.name, spec);
+      const npm = lock.npm?.packages?.[`node_modules/${b.name}`]?.resolved;
+      const pnpm = lock.pnpm?.importers?.['.']?.dependencies?.[b.name]?.version;
+      const installed = lock.preferNpm ? npm ?? pnpm : pnpm ?? npm;
+      const previous = this.rows.find(r => r.name === b.name && r.spec === spec && r.version === b.version && r.commit === githubCommit(installed));
+      return { ...previous, name: b.name, version: b.version, enabled: b.enabled, spec, source,
+        commit: githubCommit(installed), status: previous?.status ?? (source.kind === 'unsupported' ? 'unsupported' : 'unchecked'),
+        ...(source.kind === 'unsupported' ? { message: '本地文件 / 链接来源，请通过原安装方式更新' } : {}) };
+    });
+  }
+  async checkRow(row) {
+    try {
+      if (row.source.kind === 'npm') {
+        const spec = `${row.source.package}@${row.source.tag}`;
+        const found = await this.lookup(this.service(), this.profile(), spec, this.abort.signal);
+        if (!found.version || found.problem && found.problem !== 'already-installed') throw Error(found.problem === 'not-found' ? 'npm 中未找到该包或频道' : 'npm 查询失败；请检查 DSH 的网络与 registry 设置');
+        if (!parseWorkBuddyVersion(found.version) || row.version && !parseWorkBuddyVersion(row.version)) throw Error('无法比较版本号');
+        row.latestVersion = found.version;
+        row.target = `${row.name}@${row.source.alias ? `npm:${row.source.package}@` : ''}${row.source.channel ? row.source.tag : found.version}`;
+        row.status = !row.version || compareWorkBuddyVersions(found.version, row.version) > 0 ? 'available' : 'current';
+        row.message = !row.version ? '安装文件不可读，可重新安装该来源修复' : row.status === 'current' ? '当前版本已是该频道最新，或高于该频道' : undefined;
+      } else if (row.source.kind === 'github') {
+        const { owner, repo, ref } = row.source;
+        const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/commits/${encodeURIComponent(ref ?? 'HEAD')}`;
+        const found = await publicJson(url, this.fetchImpl, this.abort.signal);
+        if (!/^[a-f0-9]{40}$/i.test(found.sha)) throw Error('GitHub 返回无效提交信息');
+        row.latestCommit = found.sha.toLowerCase();
+        row.target = `${row.name}@${row.spec}`;
+        row.status = row.commit === row.latestCommit ? 'current' : 'available';
+        row.message = row.commit ? (row.status === 'available' ? `提交 ${short(row.commit)} → ${short(row.latestCommit)}` : '该分支 / 标签的提交已同步') : '无法读取本地 Git 提交，可重新安装已检查的来源';
+        if (ref && /^[a-f0-9]{7,40}$/i.test(ref)) { row.status = 'pinned'; row.message = '安装来源固定在 Git 提交；保留此提交，不自动切换分支'; }
+      }
+      row.checkedAt = Date.now();
+      row.checkedEnabled = row.enabled;
+    } catch (error) { row.status = 'failed'; row.message = error.message; delete row.target; }
+  }
+  start(kind, task) {
+    if (this.flight) throw Error('已有插件操作正在执行，请等待完成');
+    this.job = { id: randomUUID(), kind, state: 'running', startedAt: Date.now(), results: [], total: 0 };
+    this.error = undefined;
+    this.flight = Promise.resolve().then(() => task(this.job)).then(() => { this.job.state = this.job.cancelRequested ? 'cancelled' : 'done'; }, e => { this.job.state = this.job.cancelRequested ? 'cancelled' : 'failed'; this.job.message = e.message; })
+      .finally(async () => { this.job.finishedAt = Date.now(); try { await this.persist(); } catch { this.error = '更新检查记录未能保存，请检查本地目录权限'; } this.flight = undefined; });
+  }
+  check() {
+    this.start('check', async job => {
+      this.lastAttempt = this.now(); await this.persist();
+      await this.list();
+      const rows = this.rows.filter(r => ['npm', 'github'].includes(r.source.kind)); job.total = rows.length;
+      // Small pool keeps registry requests bounded without making one failed plugin stop the list.
+      let next = 0;
+      await Promise.all(Array.from({ length: Math.min(3, rows.length) }, async () => {
+        while (next < rows.length && !job.cancelRequested) { const row = rows[next++]; await this.checkRow(row); job.results.push({ name: row.name, status: row.status, message: row.message }); }
+      }));
+      this.checkedAt = Date.now();
+    });
+  }
+  async installRow(row, registry) {
+    const original = await jsonFile(join(this.profile().dir, 'package.json'));
+    if (original?.dependencies?.[row.name] !== row.spec) throw Error('安装来源已改变，请重新检查');
+    const current = (await this.service().listBundles()).find(b => b.name === row.name);
+    if (!current || current.enabled !== row.checkedEnabled || current.version !== row.version) throw Error('插件版本或启用状态已改变，请重新检查');
+    const options = { enabled: row.enabled, requestId: this.job.id, ...(registry ? { registry } : {}) };
+    let result;
+    if (row.source.kind === 'github') {
+      this.gitAbort = new AbortController();
+      try { result = await this.refreshGit(this.service(), this.profile(), row, options, AbortSignal.any([this.abort.signal, this.gitAbort.signal])); }
+      finally { this.gitAbort = undefined; }
+    } else result = await outsideActivation(this.hmr(), () => this.service().installBundle(row.target, options));
+    if (installFailed(result)) return { name: row.name, ...installFailure(result), expectedVersion: row.latestVersion };
+    const installed = (await this.service().listBundles()).find(b => b.name === row.name);
+    if (row.source.kind === 'npm' && installed?.version !== row.latestVersion) return { name: row.name, status: 'failed',
+      message: `实际安装版本 ${installed?.version ?? '未知'} 与检查版本 ${row.latestVersion} 不同；请稍后重新检查，可能是镜像尚未同步或发行时间限制` };
+    if (row.source.kind === 'github') {
+      const lock = await locks(this.profile().dir);
+      const pnpm = lock.pnpm?.importers?.['.']?.dependencies?.[row.name]?.version, npm = lock.npm?.packages?.[`node_modules/${row.name}`]?.resolved;
+      if (githubCommit(lock.preferNpm ? npm ?? pnpm : pnpm ?? npm) !== row.latestCommit) return { name: row.name, status: 'failed', restartRequired: true,
+        message: '实际 Git 提交与检查结果不一致，请重新检查后重试；不把仍停留在旧锁文件的安装报告为成功' };
+    }
+    const reloadPending = result.application === 'restart-required' && this.onInstalled?.(row.name) === true;
+    return { name: row.name, status: 'installed', application: reloadPending ? 'reload-pending' : result.application, message: reloadPending ? '已安装，等待当前操作结束后自动加载；运行版本见面板顶部' : result.application === 'restart-required' ? '已安装，完全退出并重新打开 DSH 后生效' : '安装完成', restartRequired: !reloadPending && result.application === 'restart-required' };
+  }
+  update(names, registry) {
+    if (!Array.isArray(names) || !names.length || names.length > 200 || names.some(n => typeof n !== 'string') || new Set(names).size !== names.length) throw Error('请选择要更新的插件');
+    const selected = names.map(name => this.rows.find(r => r.name === name));
+    if (selected.some(r => !r || !['available', 'failed'].includes(r.status) || !r.target || Date.now() - r.checkedAt > 600000)) throw Error('请先检查更新，再选择可更新的插件（检查结果有效期 10 分钟）');
+    // Updating this manager last avoids losing the batch if the host gains module reload support.
+    selected.sort((a, b) => Number(a.name === 'dsh-multi-router') - Number(b.name === 'dsh-multi-router'));
+    this.start('update', async job => {
+      job.total = selected.length;
+      for (const row of selected) {
+        if (job.cancelRequested) break;
+        job.current = row.name;
+        let result;
+        try { result = await this.installRow(row, registry); } catch (e) { result = { name: row.name, status: 'failed', message: e.message }; }
+        job.results.push(result);
+        row.status = result.status; row.message = result.message;
+      }
+      delete job.current; await this.list();
+    });
+  }
+  install(spec, registry) {
+    if (typeof spec !== 'string' || spec.length > 600 || spec.startsWith('-') || /[\s\x00-\x1f]/.test(spec)) throw Error('请输入一个 npm 包名或 GitHub 安装地址');
+    const named = /^((?:@[^/]+\/)?[^@]+)(?:@(.+))?$/.exec(spec);
+    const github = parsePluginSource('placeholder', spec);
+    const npm = named && parsePluginSource(named[1], named[2] || 'latest');
+    if (github.kind !== 'github' && npm?.kind !== 'npm') throw Error('仅支持 npm 包名 / 版本或 github:用户/仓库');
+    this.start('install', async job => {
+      job.total = 1; job.current = spec;
+      // Resolve before installation and verify afterwards: a stale mirror must
+      // not silently turn "latest" into an older successful installation.
+      let expected;
+      if (npm?.kind === 'npm' && github.kind !== 'github') {
+        const found = await this.lookup(this.service(), this.profile(), `${npm.package}@${named[2] || 'latest'}`, this.abort.signal, registry);
+        if (!parseWorkBuddyVersion(found.version)) throw Error('npm 未返回有效版本，请检查安装源后重试');
+        expected = found.version;
+      }
+      const result = await outsideActivation(this.hmr(), () => this.service().installBundle(spec, { requestId: job.id, ...(registry ? { registry } : {}) }));
+      if (installFailed(result)) { job.results.push({ name: result.bundle ?? spec, ...installFailure(result), expectedVersion: expected }); delete job.current; await this.list(); return; }
+      const installed = (await this.service().listBundles()).find(b => b.name === (result.bundle ?? named?.[1]));
+      if (expected && installed?.version !== expected) {
+        job.results.push({ name: result.bundle ?? named[1], status: 'failed', expectedVersion: expected, installedVersion: installed?.version,
+          message: `实际安装版本 ${installed?.version ?? '未知'} 与检查版本 ${expected} 不同；请切换「npm 官方」后重新检查并安装指定版本。` });
+        delete job.current; await this.list(); return;
+      }
+      const reloadPending = !result.error && result.packageResult?.exitCode === 0 && result.application === 'restart-required' && this.onInstalled?.(result.bundle) === true;
+      job.results.push({ name: result.bundle ?? spec, status: result.error || ['failed', 'cancelled'].includes(result.application) || result.packageResult && result.packageResult.exitCode !== 0 ? 'failed' : 'installed',
+        message: result.error ? `安装未完成（${result.error.code}），请查看 DSH 插件安装日志` : reloadPending ? '已安装，等待当前操作结束后自动加载' : result.application === 'restart-required' ? '已安装，请完全退出并重启 DSH' : '安装完成',
+        application: reloadPending ? 'reload-pending' : result.application, pendingBuilds: result.pendingBuilds ?? [], restartRequired: !reloadPending && result.application === 'restart-required' });
+      delete job.current; await this.list();
+    });
+  }
+  async action(input) {
+    if (!this.state().available) throw Error('当前 DSH 未提供插件管理接口，请升级 DSH 后重试');
+    if (input.registry && !['https://registry.npmjs.org/', 'https://registry.npmmirror.com/'].includes(input.registry)) throw Error('无效的 npm 来源');
+    if (input.action === 'plugins.list') { if (!this.flight) await this.list(); }
+    else if (input.action === 'plugins.dismiss') await this.dismiss(input.keys);
+    else if (input.action === 'plugins.check') this.check();
+    else if (input.action === 'plugins.update') this.update(input.names, input.registry);
+    else if (input.action === 'plugins.install') this.install(input.spec, input.registry);
+    else if (input.action === 'plugins.cancel') { if (this.job?.state === 'running') { this.job.cancelRequested = true; if (this.gitAbort) this.gitAbort.abort(); else if (this.job.kind !== 'check') await this.service().cancelInstall?.(this.job.id); } }
+    else throw Error('未知插件操作');
+  }
+}

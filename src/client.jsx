@@ -1,0 +1,628 @@
+import { useEffect, useRef, useState } from 'react';
+import { version as pluginVersion } from '../package.json';
+export const name = 'dsh-multi-router-client';
+export const inject = ['slots'];
+const ENDPOINT = '/.well-known/dsh-multi-router';
+let reloadFromHost;
+export async function requestPluginReload(remote) {
+  if (!remote?.pluginManager?.setBundleEnabled) throw Error('当前 DSH 未提供重新加载接口，请升级 DSH 或在插件页关闭后重新启用本插件。');
+  const answer = await remote.pluginManager.setBundleEnabled('dsh-multi-router', true);
+  const result = answer?.ok === true ? answer.value : answer;
+  if (answer?.ok === false || result?.application !== 'applied') throw Error('DSH 未能即时重载，请检查组件错误；不支持热加载的旧版 DSH 仍需重启。');
+}
+export const backendNeedsRestart = data => !!data && data.pluginVersion !== pluginVersion;
+export function RestartGuidance({ data, retry, reload, busy }) {
+  return <section className="box stack" role="alert"><h3>插件正在连接或同步版本</h3>
+    <p>{data ? `面板 v${pluginVersion}，运行中的后台 v${data.pluginVersion || '旧版'}。正在等待 DSH 同步新版本。` : '暂时无法连接插件后台。安装或更新后会自动重试，也可以只重新加载本插件。'}</p>
+    <div className="row"><button disabled={busy} onClick={reload}>重新加载插件</button><button disabled={busy} onClick={retry}>重新连接</button></div>
+    <details><summary>仍无法连接？</summary><p className="notice">先检查下方组件的启用错误。旧版 DSH 若不支持运行中重载，可升级 DSH，或通过「退出 DeepSeek Harness」完全退出后重新打开。关闭窗口不等于退出，账号、路由与用量会保留。</p></details></section>;
+}
+export async function readManagementResponse(res) {
+  let next;
+  try { next = JSON.parse(await res.text()); } catch {
+    throw Error(`插件后台未就绪（HTTP ${res.status}）。正在重新连接；若持续失败，请重新加载插件并检查组件错误。`);
+  }
+  if (!next || typeof next !== 'object' || Array.isArray(next)) throw Error('插件后台返回了无效数据，请刷新面板或重启 DSH。');
+  if (!res.ok) throw Error(next.error || `操作失败（HTTP ${res.status}）`);
+  return next;
+}
+const fmt = n => typeof n === 'number' ? new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(n) : '—';
+const when = n => n ? new Date(n).toLocaleString('zh-CN', { hour12: false }) : '尚未获取';
+const strategies = { failover: '故障切换', weighted: '按权重分配', tokens: '按 Token 额度轮换', credits: '按积分消耗轮换' };
+const loginNames = { valid: '登录有效', configured: '已保存 PAT', 'refresh-needed': '等待刷新', expired: '登录已过期', missing: '未获取登录信息' };
+const effortNames = { off: '关闭思考 · Off', minimal: '最低 · Minimal', low: '低 · Low', medium: '中 · Medium', high: '高 · High', xhigh: '超高 · XHigh', max: '最高 · Max' };
+function downloadJson(exported) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(exported.document, null, 2)], { type: 'application/json' }));
+  const a = document.createElement('a'); a.href = url; a.download = exported.filename; document.body.append(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(url), 10000);
+}
+const styles = `
+.mr{--mr-accent:var(--dsw-alias-state-active-primary,#3a71db);--mr-border:var(--dsw-alias-border-l2,#444);--mr-bg:var(--dsw-alias-bg-layer-1,#202020);--mr-card:var(--dsw-alias-bg-module-platform,#282828);--mr-text:var(--dsw-alias-label-primary,#f4f4f4);--mr-muted:var(--dsw-alias-label-secondary,#b0b0b0);color:var(--mr-text);font:inherit;font-size:14px;line-height:1.6;max-width:1120px}
+.mr *{box-sizing:border-box}.mr h2,.mr h3,.mr p{margin:0}.mr h2{font-size:22px}.mr h3{font-size:16px}.mr small,.mr .muted,.mr .notice{color:var(--mr-muted)}.mr .notice{font-size:13px}.mr .mono{font:12px ui-monospace,monospace;overflow-wrap:anywhere}
+.mr .bar,.mr .row{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.mr .bar{justify-content:space-between}.mr .stack{display:flex;flex-direction:column;gap:16px}.mr .grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px}.mr .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}.mr .providers{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.mr .full{grid-column:1/-1}
+.mr .box{border:1px solid var(--mr-border);border-radius:12px;padding:20px;background:var(--mr-card)}.mr .metric strong{font-size:26px;line-height:1.3;display:block;margin:8px 0}.mr .metric small{font-size:12px}.mr .item{padding:16px 0;border-top:1px solid var(--mr-border)}.mr .item:first-child{border-top:0}.mr .item:last-child{padding-bottom:0}.mr .badge{border:1px solid var(--mr-border);border-radius:6px;padding:3px 8px;font-size:12px;white-space:nowrap}.mr .empty{padding:24px 0;text-align:center;color:var(--mr-muted)}
+.mr nav{display:flex;flex-wrap:wrap;gap:8px;border-bottom:1px solid var(--mr-border);padding:18px 0;margin-bottom:20px}.mr button,.mr input,.mr select,.mr textarea,.mr .link{font:inherit;color:inherit;border:1px solid var(--mr-border);border-radius:8px;background:var(--mr-bg);min-height:44px;padding:9px 12px}.mr button,.mr .link{cursor:pointer;transition:background .15s}.mr button:hover,.mr .link:hover{background:var(--mr-card)}.mr button:disabled{opacity:.45;cursor:default}.mr button.primary,.mr button[aria-pressed=true]{background:var(--mr-accent);color:#fff;border-color:transparent}.mr button.quiet{border-color:transparent;background:transparent}.mr :is(button,input,select,textarea,a):focus-visible{outline:2px solid var(--mr-accent);outline-offset:3px}.mr input:not([type=checkbox]),.mr select,.mr textarea{width:100%;min-width:0}.mr input[type=checkbox]{width:18px;height:18px;min-height:0;accent-color:var(--mr-accent)}.mr label{display:flex;flex-direction:column;gap:6px;font-size:13px}.mr label.check{flex-direction:row;align-items:center;gap:8px;min-height:44px}.mr .filter{min-width:170px;max-width:240px}.mr .feedback{padding:12px 16px;border-radius:8px;border:1px solid var(--mr-border)}.mr .error{color:var(--dsw-alias-state-error-primary,#ef9393)}.mr .good{color:var(--dsw-alias-state-success-primary,#77ca9d)}.mr .route-path{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.mr .route-path span{padding:4px 9px;border:1px solid var(--mr-border);border-radius:6px}.mr details{border-top:1px solid var(--mr-border);padding-top:14px}.mr summary{cursor:pointer;color:var(--mr-muted)}.mr progress{width:100%;height:7px;accent-color:var(--mr-accent)}.mr .trend{height:100px;display:flex;align-items:flex-end;gap:8px;margin:16px 0}.mr .trend>div{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;min-width:0}.mr .trend i{display:block;width:100%;min-height:3px;border-radius:4px 4px 0 0;background:var(--mr-accent)}.mr .trend small{font-size:11px;white-space:nowrap}.mr .table{width:100%;border-collapse:collapse;font-size:13px}.mr th,.mr td{text-align:left;border-bottom:1px solid var(--mr-border);padding:10px 8px}.mr th{font-weight:500;color:var(--mr-muted)}.mr .scroll{overflow:auto}.mr .steps{padding:14px 16px;border-left:3px solid var(--mr-accent);background:var(--mr-bg);border-radius:8px}.mr .link{text-decoration:none;display:inline-flex;align-items:center}
+.mr dialog{color:var(--mr-text);background:var(--mr-bg);border:1px solid var(--mr-border);border-radius:16px;width:min(900px,calc(100vw - 32px));max-height:calc(100vh - 40px);padding:0;box-shadow:0 24px 80px #0008}.mr dialog::backdrop{background:#000a}.mr .modal-head,.mr .modal-foot{padding:18px 24px;background:var(--mr-bg);position:sticky;z-index:1}.mr .modal-head{top:0;border-bottom:1px solid var(--mr-border)}.mr .modal-foot{bottom:0;border-top:1px solid var(--mr-border)}.mr .modal-body{padding:24px}.mr .target-head strong{font-size:14px}.mr .subtle{background:var(--mr-bg)}
+@media(max-width:850px){.mr .providers{grid-template-columns:1fr}.mr .metrics{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:600px){.mr .grid{grid-template-columns:1fr}.mr .box{padding:16px}.mr nav{flex-wrap:wrap}.mr .modal-body,.mr .modal-head,.mr .modal-foot{padding:16px}.mr .metrics{gap:8px}.mr .metric strong{font-size:22px}}
+.mr{--mr-soft:color-mix(in srgb,var(--mr-text) 3%,var(--mr-card));--mr-selected:color-mix(in srgb,var(--mr-accent) 7%,var(--mr-card));max-width:1280px;min-width:0;line-height:1.55}
+.mr h2{font-size:24px;letter-spacing:-.5px;font-weight:650}.mr h3{font-weight:600}.mr .stack{gap:20px}.mr .row{gap:8px}.mr .box{border-radius:14px;background:var(--mr-card)}.mr .box.stack{gap:16px}
+.mr nav{gap:4px;padding:16px 0 0;margin-bottom:24px}.mr nav button{border:0;border-radius:0;background:transparent;padding:12px 14px;border-bottom:2px solid transparent;color:var(--mr-muted)}.mr nav button[aria-pressed=true]{background:transparent;color:var(--mr-text);border-bottom-color:var(--mr-text);font-weight:600}.mr nav button:hover{background:var(--mr-soft)}
+.mr button.primary{background:var(--mr-text);color:var(--mr-card);border-color:var(--mr-text)}.mr button.primary:hover{opacity:.85}.mr button:active:not(:disabled){filter:brightness(.9)}.mr button.quiet{color:var(--mr-muted)}.mr .badge{border-radius:100px;background:var(--mr-soft);padding:4px 10px}.mr .metric{background:var(--mr-soft)}.mr .metric strong{font-size:28px;font-variant-numeric:tabular-nums;letter-spacing:-.5px;margin:10px 0 4px}.mr .metrics{gap:16px}
+.mr .status{display:inline-flex;align-items:center;gap:7px;font-size:13px;white-space:nowrap}.mr .status i{width:8px;height:8px;border-radius:50%;background:var(--mr-muted);display:inline-block;flex-shrink:0}.mr .status i.good{background:var(--dsw-alias-state-success-primary,#38a16a)}.mr .status i.warn{background:var(--dsw-alias-state-warning-primary,#c48b28)}.mr .warn{color:var(--dsw-alias-state-warning-primary,#c48b28)}
+.mr .table-shell{padding:0;overflow:hidden}.mr .scroll>.table{min-width:760px}.mr .table{font-size:14px}.mr .table th{background:var(--mr-soft);font-size:12px;letter-spacing:.02em;font-weight:500;white-space:nowrap}.mr .table th,.mr .table td{padding:16px 20px;vertical-align:middle}.mr .table td:last-child{white-space:nowrap}.mr .table tbody tr:last-child td{border-bottom:0}.mr .table td small{display:block;font-size:12px;margin-top:3px}.mr .table td>strong{font-weight:600}.mr .table tr.selected{background:var(--mr-selected)}.mr .table tbody tr:hover{background:var(--mr-soft)}.mr .table .account-name{max-width:230px;overflow-wrap:anywhere}.mr .table .amount{font-size:20px;line-height:1.35;font-variant-numeric:tabular-nums;font-weight:600;white-space:nowrap}.mr .table .cell-actions{white-space:nowrap;text-align:right}.mr .table .account-check{min-width:44px;min-height:44px;justify-content:center;flex-shrink:0}.mr .table .account-cell{display:flex;gap:10px;align-items:center}.mr .table .account-cell .check{margin-left:-12px}.mr .table .account-cell input{accent-color:var(--mr-text)}.mr .table .row{flex-wrap:nowrap}.mr .section-title{margin-bottom:4px}.mr .toolbar{align-items:flex-end;gap:16px}.mr .search{max-width:280px;flex:1;min-width:160px}.mr .table-footer{padding:14px 20px;background:var(--mr-soft)}.mr .hint{font-size:13px;color:var(--mr-muted)}.mr details.help{border:0;padding:0}.mr details.help>div{padding:12px 0;max-width:76ch}.mr .plan-form{align-items:flex-end;padding:16px 0 0;border-top:1px solid var(--mr-border)}.mr .plan-form .filter{min-width:180px}.mr .steps{border:1px solid var(--mr-border);border-radius:10px;background:var(--mr-soft);padding:14px 16px}.mr .route-path span{background:var(--mr-soft);border-color:transparent;font-size:12px}.mr .route-card details{padding-top:10px}.mr .feedback{margin-bottom:16px}.mr .box .feedback{margin-bottom:0}.mr .scroll{max-width:100%}.mr .scroll:focus-visible{outline:2px solid var(--mr-accent);outline-offset:-3px}
+@media(max-width:850px){.mr .metrics{gap:10px}.mr nav{gap:0}.mr nav button{padding:12px 10px}}@media(max-width:600px){.mr h2{font-size:22px}.mr nav{display:grid;grid-template-columns:repeat(4,minmax(0,1fr))}.mr nav button{padding:10px 4px;font-size:12px;white-space:nowrap}.mr .toolbar>.row{width:100%}.mr .toolbar .search{max-width:none}.mr .metric strong{font-size:24px}.mr .table th,.mr .table td{padding:14px 16px}.mr .filter{max-width:none}.mr .plan-form label{flex:1}.mr .box.table-shell{padding:0}}
+
+
+.mr .metrics{gap:0;border:1px solid var(--mr-border);border-radius:12px;overflow:hidden;background:var(--mr-card)}
+.mr .metrics .metric{border:0;border-radius:0;background:transparent;border-right:1px solid var(--mr-border);padding:16px 20px}.mr .metrics .metric:last-child{border-right:0}.mr .metric strong{font-size:25px;margin:6px 0}.mr .performance{gap:10px}.mr .performance .metrics{background:var(--mr-soft);border-color:transparent}.mr .performance .metric strong{font-size:21px}.mr .performance .metric{padding:12px 20px}.mr .performance h3{font-size:14px}.mr .refresh-control{font-size:12px;color:var(--mr-muted)}
+.mr .section-pad{padding:16px 20px}.mr .table-shell>.section-pad+.section-pad{padding-top:0}.mr .route-table td{max-width:300px}.mr .route-table .route-targets{max-width:300px;white-space:normal;overflow-wrap:anywhere}.mr .route-table small{max-width:320px}.mr .model-table td:first-child{width:38%}.mr .table .cell-actions{width:1%}.mr .install-plugin>div{padding-top:16px}.mr details.help.box{padding:18px 20px}.mr .sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap}
+@media(max-width:600px){.mr .metrics .metric{padding:12px 14px}.mr .metrics .metric:nth-child(2){border-right:0}.mr .metrics .metric:nth-child(-n+2){border-bottom:1px solid var(--mr-border)}.mr .section-pad{padding:14px 16px}}
+
+@media(prefers-reduced-motion:reduce){.mr *{transition:none!important}}
+`;
+export function apply(ctx) {
+  reloadFromHost = () => requestPluginReload(ctx.get?.('remote'));
+  ctx.slots.inject('plugins.bundle.config', () => ctx.slots.register({ name: 'plugins.bundle.config', key: 'dsh-multi-router' }, RouterPage));
+  ctx.slots.inject('shell.overlay', () => ctx.slots.register({ name: 'shell.overlay', id: 'dsh-multi-router-updates' }, UpdateReminder));
+  ctx.slots.inject('sidebar.footer.action', () => ctx.slots.register({ name: 'sidebar.footer.action', id: 'dsh-multi-router-usage', order: 10,
+    inject: () => ({ open: () => {
+      const navigation = ctx.get?.('pluginNavigation');
+      if (!navigation?.openBundle) throw Error('请在插件页打开 dsh-multi-router；当前 DSH 未提供详情导航。');
+      navigation.openBundle('dsh-multi-router');
+    } }) }, SidebarUsage));
+}
+const SUMMARY_EVENT = 'dsh-multi-router-summary';
+const compactTokens = n => n >= 1e9 ? `${(n / 1e9).toFixed(1)}B` : n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1000 ? `${(n / 1000).toFixed(1)}K` : fmt(n);
+export function SidebarUsageCard({ data, wide = true, open, error }) {
+  const title = `${data.today}（北京时间）\n今日 ${fmt(data.tokens)} Token · ${fmt(data.requests)} 次请求\n累计 ${fmt(data.totalTokens)} Token${data.unmetered ? `\n${fmt(data.unmetered)} 次调用未返回用量` : ''}${error ? `\n${error}` : ''}\n点击打开账号与路由`;
+  return <><style>{`
+    [class*="_footArea"] [class*="_footerActions"]:has(.mr-sidebar-usage){flex-direction:column}
+    .mr-sidebar-usage{box-sizing:border-box;display:flex;align-items:center;gap:10px;width:100%;min-width:0;min-height:48px;padding:7px 10px;border:1px solid var(--dsw-alias-border-l2,#444);border-radius:8px;background:transparent;color:var(--dsw-alias-label-primary,#eee);font:inherit;text-align:left;cursor:pointer}
+    .mr-sidebar-usage:hover{background:var(--dsw-alias-bg-module-platform,#303036)}.mr-sidebar-usage:focus-visible{outline:2px solid var(--dsw-alias-state-active-primary,#3a71db);outline-offset:2px}
+    .mr-sidebar-usage svg{flex-shrink:0}.mr-sidebar-usage span{flex:1;min-width:0}.mr-sidebar-usage small{display:block;color:var(--dsw-alias-label-secondary,#aaa);font-size:10px;line-height:15px;white-space:nowrap}.mr-sidebar-usage strong{display:block;font-size:13px;font-weight:600;line-height:18px;font-variant-numeric:tabular-nums;white-space:nowrap}.mr-sidebar-usage[data-wide=false]{width:36px;min-height:36px;padding:8px;justify-content:center}
+  `}</style><button className="mr-sidebar-usage" data-wide={wide} title={title} aria-label={`Token 用量概览，今日 ${fmt(data.tokens)}，累计 ${fmt(data.totalTokens)}，打开插件详情`} onClick={open}>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true"><path d="M4 4v16h17M8 16v-5m5 5V7m5 9v-7" /></svg>
+    {wide && <><span><small>今日 Token{error ? ' · 未刷新' : ''}</small><strong>{compactTokens(data.tokens)}</strong></span><span><small>累计 Token</small><strong>{compactTokens(data.totalTokens)}</strong></span></>}
+  </button></>;
+}
+export function SidebarUsage({ wide = true, open }) {
+  const [data, setData] = useState(null), [error, setError] = useState('');
+  useEffect(() => {
+    let stopped = false, pending = false, again = false;
+    const abort = new AbortController();
+    async function poll(event) {
+      if (document.hidden) return;
+      if (pending) { if (event?.type === SUMMARY_EVENT) again = true; return; }
+      pending = true;
+      try {
+        const next = await readManagementResponse(await fetch(`${ENDPOINT}/summary`, { cache: 'no-store', signal: AbortSignal.any([abort.signal, AbortSignal.timeout(8000)]) }));
+        if (!stopped) { setData(next); setError(''); }
+      } catch { if (!stopped) setError('暂时无法刷新本机统计'); } finally { pending = false; if (again && !stopped) { again = false; void poll(); } }
+    }
+    void poll(); const timer = setInterval(() => { void poll(); }, 60000);
+    document.addEventListener('visibilitychange', poll); window.addEventListener(SUMMARY_EVENT, poll);
+    return () => { stopped = true; abort.abort(); clearInterval(timer); document.removeEventListener('visibilitychange', poll); window.removeEventListener(SUMMARY_EVENT, poll); };
+  }, []);
+  if (!data || data.enabled === false) return null;
+  return <SidebarUsageCard data={data} wide={wide} error={error} open={() => { try { open(); } catch (e) { setError(e.message); } }} />;
+}
+function Modal({ title, close, children, busy }) {
+  const ref = useRef(null);
+  useEffect(() => { const dialog = ref.current; dialog.showModal(); return () => dialog.close(); }, []);
+  return <dialog ref={ref} aria-label={title} onCancel={e => { e.preventDefault(); if (!busy) close(); }}>
+    <div className="modal-head bar"><h2>{title}</h2><button type="button" disabled={busy} onClick={close}>关闭</button></div>{children}
+  </dialog>;
+}
+export function UpdateReminder() {
+  const [data, setData] = useState(null), [opened, setOpened] = useState(null), [manage, setManage] = useState(false), [busy, setBusy] = useState(false), [error, setError] = useState('');
+  useEffect(() => {
+    let live = true, pending = false;
+    async function poll() { if (document.hidden || pending) return; pending = true; try { const next = await readManagementResponse(await fetch(ENDPOINT, { cache: 'no-store' })); if (live && !backendNeedsRestart(next)) { setData(next); setOpened(current => current ?? (next.pluginUpdates?.reminders?.length && !document.querySelector('dialog[open]') ? next.pluginUpdates.reminders : null)); } } catch { /* Settings page owns backend recovery guidance. */ } finally { pending = false; } }
+    void poll(); const timer = setInterval(() => { void poll(); }, 60000);
+    return () => { live = false; clearInterval(timer); };
+  }, []);
+  useEffect(() => { if (data?.pluginUpdates?.job?.state !== 'running') return; let live = true; const timer = setInterval(() => { void fetch(ENDPOINT, { cache: 'no-store' }).then(readManagementResponse).then(next => { if (live) setData(next); }).catch(() => {}); }, 2000); return () => { live = false; clearInterval(timer); }; }, [data?.pluginUpdates?.job?.state]);
+  async function act(action) {
+    if (busy) return false; setBusy(true); setError('');
+    try { const next = await readManagementResponse(await fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Multi-Router-Key': data.key }, body: JSON.stringify({ revision: data.revision, ...action }) })); setData(next); return next; }
+    catch (e) { setError(e.message); return false; } finally { setBusy(false); }
+  }
+  async function dismiss() { if (await act({ action: 'plugins.dismiss', keys: opened.map(r => r.key) })) { setOpened(null); setManage(false); } }
+  if (!opened || !data) return null;
+  return <div className="mr"><style>{styles}</style><Modal title="发现插件更新" busy={busy || data.pluginUpdates?.job?.state === 'running'} close={() => { void dismiss(); }}><div className="modal-body stack"><Feedback error={error} />
+    {manage ? <PluginUpdatesPanel data={data.pluginUpdates} busy={busy} act={act} /> : <><p>{opened.length} 个用户安装的插件有更新。请选择查看更新，或稍后处理。</p><ul>{opened.map(r => <li key={r.key}><strong>{r.name}</strong> · {r.version || '未知版本'} → {r.latestVersion || `Git ${r.latestCommit?.slice(0, 8)}`}</li>)}</ul><p className="notice">每 24 小时自动检查 GitHub / npm 安装来源；同一版本只提醒一次。DSH 内置插件不参与检查，不会自动安装更新。</p></>}
+    <div className="row"><button disabled={busy || data.pluginUpdates?.job?.state === 'running'} onClick={() => { void dismiss(); }}>稍后处理</button>{!manage && <button className="primary" disabled={busy} onClick={() => setManage(true)}>查看并更新</button>}</div>
+  </div></Modal></div>;
+}
+function Feedback({ error, notice }) { return error ? <div className="feedback error" role="alert">{error}</div> : notice ? <div className="feedback" role="status">{notice}</div> : null; }
+const metric = (label, value, detail) => <div className="box metric"><small>{label}</small><strong>{value}</strong><small>{detail}</small></div>;
+export function RouterPage({ view = 'page' }) {
+  const [data, setData] = useState(null), [tab, setTab] = useState('overview');
+  const [accountProvider, setAccountProvider] = useState(''), [provider, setProvider] = useState('workbuddy'), [busy, setBusy] = useState(false), [live, setLive] = useState(true);
+  const [error, setError] = useState(''), [notice, setNotice] = useState(''), [draft, setDraft] = useState(null), [accountModal, setAccountModal] = useState(null), [presetModal, setPresetModal] = useState(false), [search, setSearch] = useState('');
+  const polling = useRef(false);
+  async function load(signal = AbortSignal.timeout(8000)) { const next = await readManagementResponse(await fetch(ENDPOINT, { cache: 'no-store', signal })); setData(next); setError(''); }
+  useEffect(() => {
+    if (view === 'summary') return;
+    let stopped = false, retry, attempts = 0;
+    const abort = new AbortController();
+    async function connect() {
+      try { await load(AbortSignal.any([abort.signal, AbortSignal.timeout(4000)])); }
+      catch (e) { if (stopped) return; if (++attempts < 8) retry = setTimeout(connect, 750); else setError(e.message); }
+    }
+    void connect();
+    const timer = live && setInterval(() => { if (document.hidden || polling.current) return; polling.current = true; void load(abort.signal).catch(e => { if (!stopped) setError(e.message); }).finally(() => { polling.current = false; }); }, 60000);
+    return () => { stopped = true; abort.abort(); clearTimeout(retry); clearInterval(timer); };
+  }, [view, live]);
+  useEffect(() => {
+    if (data?.startup?.phase !== 'discovering' && !['waiting', 'reloading'].includes(data?.runtime?.phase) && data?.pluginUpdates?.job?.state !== 'running' && !data?.checkins?.running) return;
+    const timer = setInterval(() => { if (document.hidden || polling.current) return; polling.current = true; void load().catch(e => setError(e.message)).finally(() => { polling.current = false; }); }, 2000);
+    return () => clearInterval(timer);
+  }, [data?.startup?.phase, data?.runtime?.phase, data?.pluginUpdates?.job?.state, data?.checkins?.running]);
+  async function reload() { setBusy(true); setError(''); try { if (!reloadFromHost) throw Error('请在 DSH 插件页重新启用本插件。'); await reloadFromHost(); await load(); } catch (e) { setError(e.message); } finally { setBusy(false); } }
+  async function act(action) {
+    if (busy || backendNeedsRestart(data)) return false;
+    setBusy(true); setError(''); setNotice('');
+    try { const res = await fetch(ENDPOINT, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Multi-Router-Key': data.key }, body: JSON.stringify({ revision: data.revision, ...action }) });
+      const next = await readManagementResponse(res); const { exported, workbuddyLogin, loginResult, apiKey, modelTest, ...state } = next; setData(state); if (action.sidebarUsage !== undefined || action.action === 'config.import') window.dispatchEvent(new Event(SUMMARY_EVENT)); setNotice(action.action === 'model.test' ? '' : action.action.startsWith('api.') ? next.apiService?.phase === 'error' ? '配置已保存，但服务尚未启动，请查看下方提示。' : action.action === 'api.key.reveal' ? '' : 'API 设置已保存。' : action.action === 'workbuddy.sms' ? '' : action.action === 'workbuddy.login' ? loginResult?.warning || '登录凭证已保存，自动签到开关保持原设置。' : action.action === 'checkins.verify' ? '登录验证通过，旧的令牌失效提示已解除；未提交签到。' : action.action === 'checkins.settings' ? '签到计划已保存；今日已处理记录保持不变。' : action.action.startsWith('checkins.') || action.action.startsWith('plugins.') || action.action === 'setup.dismiss' ? '' : action.action === 'accounts.discover' || action.action === 'monitor.refresh' ? '已重新检测本机登录并刷新用量；检测结果见下方。' : action.action.includes('refresh') ? '已刷新。无法获取的账号会保留上次数据并标记。' : action.action === 'config.import' ? '配置已导入并生效，原配置已备份；模型和用量正在后台更新。' : action.action.startsWith('config.') || action.action === 'account.export' ? '' : '已保存并生效。'); return next;
+    } catch (e) { setError(e.message); return false; } finally { setBusy(false); }
+  }
+  function openAccount(mode, account) { setError(''); setNotice(''); setAccountModal({ mode, account, revision: data.revision }); }
+  const newTarget = (target = { provider: 'workbuddy' }) => ({ ...target, key: crypto.randomUUID(), weight: target.weight ?? 1, tokenBudget: target.tokenBudget ?? 100000, creditBudget: target.creditBudget ?? 100, modelText: (target.models ?? [target.model ?? '']).join(', ') });
+  function editRoute(route) { setError(''); setNotice(''); setDraft({ ...structuredClone(route), revision: data.revision, previousId: route.id, strategy: route.strategy ?? 'failover', targets: route.targets.map(newTarget) }); }
+  const p = data?.providers.find(p => p.id === provider);
+  const providerSelect = <label className="filter">供应商 / 区域<select value={provider} onChange={e => { setProvider(e.target.value); setSearch(''); }}>{data?.providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>;
+  const accountProviderSelect = <label className="filter">供应商 / 区域<select value={accountProvider} onChange={e => setAccountProvider(e.target.value)}><option value="">全部供应商</option>{data?.providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>;
+  if (view === 'summary') return '三家账号与登录信息、用量监控、模型管理，以及权重和额度路由。';
+  return <div className="mr"><style>{styles}</style><div className="bar"><div><h2>账号与路由</h2><p className="muted">管理三家账号、模型与用量</p></div><div className="row"><span className="badge">v{data?.pluginVersion ?? pluginVersion}</span><label className="check refresh-control"><input type="checkbox" disabled={busy || !data || backendNeedsRestart(data)} checked={data?.options?.sidebarUsage !== false} onChange={e => { void act({ action: 'options.save', sidebarUsage: e.target.checked }); }} />侧栏用量</label><span className="status"><i className={busy || !data ? 'warn' : 'good'} aria-hidden="true" />{busy ? '正在处理…' : !data ? '正在连接…' : '本机运行'}</span><label className="check refresh-control"><input type="checkbox" checked={live} onChange={e => setLive(e.target.checked)} />每分钟刷新</label><button disabled={busy} onClick={() => { void load().catch(e => setError(e.message)); }}>刷新面板</button></div></div>
+    <nav aria-label="路由插件配置页签">{[['overview', '总览与用量'], ['usage', 'Token 明细'], ['accounts', '账号与登录'], ['checkins', '积分签到'], ['models', '模型管理'], ['routes', '路由规则'], ['api', 'API 服务'], ['plugins', '插件更新'], ['migration', '配置迁移']].map(([key, label]) => <button key={key} aria-pressed={tab === key} onClick={() => { setTab(key); setError(''); setNotice(''); }}>{label}</button>)}</nav>
+    {!draft && !accountModal && !presetModal && <Feedback error={error} notice={notice} />}
+    {(backendNeedsRestart(data) || (!data && error)) && <RestartGuidance data={data} busy={busy} reload={() => { void reload(); }} retry={() => { void load().catch(e => setError(e.message)); }} />}
+    {!data ? <section className="box stack" role="status" aria-live="polite"><h3>{error ? '等待后台连接' : '正在连接本机插件…'}</h3><p className="notice">页面会自动重新连接。账号发现、用量和模型目录将在后台更新。</p><progress aria-label="正在连接插件后台" /></section> : <fieldset className="stack" style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} disabled={backendNeedsRestart(data)} aria-busy={busy}>
+      {data.startup?.phase === 'discovering' && <p className="steps" role="status">正在后台获取本机账号，已有账号和路由现在即可使用。</p>}
+      {data.runtime?.phase && data.runtime.phase !== 'current' && <section className="steps"><p>{data.runtime.message}（运行 v{data.runtime.runningVersion} / 已安装 v{data.runtime.installedVersion}）</p>{['failed', 'restart-required'].includes(data.runtime.phase) && <button disabled={busy} onClick={() => { void reload(); }}>重新加载插件</button>}</section>}
+      {['overview', 'accounts'].includes(tab) && data.setup?.dismissed !== true && <InitialSetup data={data} busy={busy} act={act} go={key => setTab(key)} />}
+      {tab === 'overview' && <Overview data={data} busy={busy} act={act} go={key => setTab(key)} />}
+      {tab === 'api' && <ApiServicePanel data={data.apiService} busy={busy} act={act} />}
+      {tab === 'plugins' && <PluginUpdatesPanel data={data.pluginUpdates} busy={busy} act={act} />}
+      {tab === 'checkins' && <CheckinPanel data={data} busy={busy} act={act} />}
+      {tab === 'usage' && <UsageDetails data={data} busy={busy} act={act} />}
+      {tab === 'accounts' && <AccountPool key={accountProvider} data={data} provider={accountProvider} providerSelect={accountProviderSelect} busy={busy} act={act} manage={a => openAccount('edit', a)} add={() => openAccount('add')} />}
+      {tab === 'models' && <ModelsPanel error={error} notice={notice} data={data} provider={provider} providerSelect={providerSelect} search={search} setSearch={setSearch} busy={busy} act={act} />}
+      {tab === 'routes' && <div className="stack"><div className="bar"><div><h3>模型路由</h3><p className="notice">{data.routes.length} 条路由 · 规则与账号在编辑中调整</p></div><div className="row"><button disabled={busy} onClick={() => { setError(''); setNotice(''); setPresetModal(true); }}>添加预配置</button><button className="primary" disabled={busy} onClick={() => { setError(''); setNotice(''); setDraft({ id: '', name: '', revision: data.revision, contextMode: 'maximum', contextWindow: 200000, maxTokens: 32000, strategy: 'failover', preferExpiringCredits: true, expiringWithinDays: 7, visible: true, targets: [newTarget()] }); }}>新建路由</button></div></div>
+        <RoutesTable data={data} busy={busy} act={act} edit={editRoute} />
+        <details><summary>全局切换设置</summary><form className="box stack" style={{ marginTop: 16 }} onSubmit={e => { e.preventDefault(); const f = new FormData(e.currentTarget); void act({ action: 'options.save', cooldownMs: Number(f.get('cooldown')) * 1000, requestTimeoutMs: Number(f.get('timeout')) * 1000, retryServerErrors: f.has('server') }); }}><div className="grid"><label>失败账号冷却（秒）<input disabled={busy} name="cooldown" type="number" min="1" required defaultValue={data.options.cooldownMs / 1000} /></label><label>请求超时（秒）<input disabled={busy} name="timeout" type="number" min="1" required defaultValue={data.options.requestTimeoutMs / 1000} /></label></div><label className="check"><input disabled={busy} name="server" type="checkbox" defaultChecked={data.options.retryServerErrors} />5xx 和网络错误也切换账号</label><div><button disabled={busy} type="submit">保存设置</button></div></form></details>
+      </div>}
+      {tab === 'migration' && <MigrationForm data={data} act={act} busy={busy} />}
+    </fieldset>}
+    {draft && <Modal title={draft.previousId ? '编辑路由' : '新建路由'} busy={busy} close={() => setDraft(null)}><RouteForm draft={draft} setDraft={setDraft} data={data} act={act} busy={busy} error={error} notice={notice} /></Modal>}
+    {presetModal && <Modal title="模型路由预配置" busy={busy} close={() => setPresetModal(false)}><div className="modal-body stack"><Feedback error={error} notice={notice} /><p className="steps">Free 自动发现各账号的免费模型；其他预配置绑定已核对的渠道模型。已有路由不会被覆盖。</p><div className="grid">{(data.presets || []).map(preset => <section key={preset.id} className="box stack"><div><h3>{preset.name}</h3></div><p className="notice">{preset.freeOnly ? '每天自动检查免费模型，调用前复核零倍率；仅在免费模型间切换。' : `已发现可用渠道：${preset.availableProviders.length} / ${preset.providerCount ?? preset.targets.length}${preset.availableProviders.length < (preset.providerCount ?? preset.targets.length) ? ' · 可添加账号或刷新模型目录后使用' : ''}`}</p><button disabled={busy || preset.added} onClick={() => { void act({ action: 'preset.add', id: preset.id }); }}>{preset.added ? '已添加' : '添加此路由'}</button></section>)}</div></div><div className="modal-foot bar"><p className="notice">新增路由可继续编辑名称、账号和切换规则。</p><button className="primary" disabled={busy || !(data.presets || []).some(p => !p.added)} onClick={() => { void act({ action: 'preset.add-all' }); }}>补齐全部预配置</button></div></Modal>}
+    {accountModal && <Modal title={accountModal.mode === 'edit' ? '账号登录详情' : accountModal.mode === 'credentials' ? '补充 / 更新账号凭证' : '添加账号与获取登录'} busy={busy} close={() => setAccountModal(null)}><AccountForm modal={accountModal} provider={accountProvider || 'workbuddy'} data={data} busy={busy} act={act} replace={() => openAccount('credentials', accountModal.account)} close={selected => { if (typeof selected === 'string' && accountProvider) setAccountProvider(selected); setAccountModal(null); }} error={error} notice={notice} /></Modal>}
+  </div>;
+}
+export function ApiServicePanel({ data: a, busy, act }) {
+  const [key, setKey] = useState(''), [hint, setHint] = useState(''), [confirmKey, setConfirmKey] = useState(null), [models, setModels] = useState(false), [example, setExample] = useState('');
+  const copyField = useRef(null);
+  useEffect(() => { setKey(current => a?.keyHint && current.endsWith(a.keyHint.slice(-4)) ? current : ''); }, [a?.keyHint]);
+  useEffect(() => { if (!key) return; const timer = setTimeout(() => setKey(''), 60000); return () => clearTimeout(timer); }, [key]);
+  if (!a) return <p className="steps">当前后台未提供 API 服务，请更新插件。</p>;
+  const save = fields => act({ action: 'api.settings', apiRevision: a.revision, ...fields });
+  async function keyAction(action) {
+    const result = await act({ action, apiRevision: a.revision });
+    if (result) { setKey(result.apiKey || ''); setConfirmKey(null); }
+  }
+  async function copy(value, fallback = false) {
+    try { await navigator.clipboard.writeText(value); setHint('已复制。'); }
+    catch { setHint('当前环境无法自动复制，请在文本框中全选复制。'); if (fallback) copyField.current?.select(); else setExample(value); }
+  }
+  const model = a.models[0]?.id || '你的路由模型 ID';
+  const command = `curl '${a.baseUrl}/chat/completions' \\\n  -H 'Authorization: Bearer YOUR_API_KEY' \\\n  -H 'Content-Type: application/json' \\\n  -d '${JSON.stringify({ model, messages: [{ role: 'user', content: '你好' }], stream: true })}'`;
+  return <div className="stack">
+    <section className="box stack"><div className="bar"><div><h3>API 服务</h3><p className="notice">将账号池与统一路由提供给其他工具。随 DSH 运行，默认关闭。</p></div><span className="status" role="status"><i className={a.phase === 'running' ? 'good' : a.phase === 'error' ? 'warn' : ''} aria-hidden="true" />{({ running: '运行中', stopped: '已关闭', starting: '启动中', error: '启动失败' })[a.phase] || a.phase}</span></div>
+      {a.error && <p className="error" role="alert">{a.error}</p>}
+      <div className="bar"><p className="notice">{a.phase === 'running' ? `${a.active} 个处理中请求 · ${a.allowLan ? '本机与网络访问' : '仅本机访问'}` : '开启后即可复制接入地址；关闭会终止正在处理的 API 请求。'}</p><label className="check"><input type="checkbox" checked={a.enabled} disabled={busy || !a.hasKey} onChange={e => { void save({ enabled: e.target.checked }); }} />启用 API 服务</label></div>
+      {!a.hasKey && <p className="steps">先生成 API Key，再启用服务。账号登录凭证不会通过此服务提供。</p>}
+    </section>
+    <div className="metrics">{metric('今日 API 调用', fmt(a.today.calls), `${a.today.attempts} 次上游尝试，含故障切换`)}{metric('今日 API Token', fmt(a.today.tokens), '平台实际返回用量')}{metric('已开放模型', fmt(a.models.length), a.modelIds === null ? '跟随路由展示设置' : '自选模型')}{metric('处理中', fmt(a.active), '最多 8 个并发 API 请求')}</div>
+    <section className="box stack"><div className="bar"><div><h3>接入信息</h3><p className="notice">客户端选择 OpenAI 兼容方式，填写下方 Base URL 与 API Key。</p></div><button disabled={busy} onClick={() => setExample(command)}>调用示例</button></div>
+      <label>Base URL<div className="row"><input className="mono" style={{ flex: 1, minWidth: 180 }} readOnly value={a.baseUrl} onFocus={e => e.currentTarget.select()} /><button onClick={() => { void copy(a.baseUrl); }}>复制地址</button></div></label>
+      {a.allowLan && <div><p className="notice">其他设备可使用以下本机网卡地址（需要网络可达及防火墙放行）：</p>{a.lanUrls.length ? a.lanUrls.map(url => <p className="mono" key={url} style={{ overflowWrap: 'anywhere' }}>{url}</p>) : <p className="notice">暂无可用 IPv4 网卡地址。</p>}</div>}
+      <label>API Key<div className="row"><input ref={copyField} className="mono" style={{ flex: 1, minWidth: 180 }} readOnly autoComplete="off" spellCheck="false" value={key || a.keyHint || '尚未生成'} onFocus={e => e.currentTarget.select()} />{a.hasKey && <><button disabled={busy} onClick={() => { if (key) setKey(''); else void keyAction('api.key.reveal'); }}>{key ? '隐藏' : '显示'}</button><button disabled={busy} onClick={async () => { const result = await act({ action: 'api.key.reveal', apiRevision: a.revision }); if (result?.apiKey) { setKey(result.apiKey); await copy(result.apiKey, true); } }}>复制 Key</button></>}</div></label>
+      <div className="row"><button disabled={busy} onClick={() => { if (a.hasKey) setConfirmKey('create'); else void keyAction('api.key.create'); }}>{a.hasKey ? '重置 API Key' : '生成 API Key'}</button>{a.hasKey && <button disabled={busy} onClick={() => setConfirmKey('revoke')}>撤销 Key 并关闭服务</button>}<p className="notice">Key 仅保存在本机私有文件；显示后 60 秒自动隐藏。</p></div>
+      {hint && <p className="notice" role="status">{hint}</p>}
+    </section>
+    <section className="box stack"><h3>服务设置</h3><form key={a.revision} className="stack" onSubmit={e => { e.preventDefault(); const f = new FormData(e.currentTarget); void save({ port: Number(f.get('port')), allowLan: f.has('lan') }); }}><div className="row"><label className="filter">监听端口<input type="number" name="port" min="1024" max="65535" required defaultValue={a.port} disabled={busy} /></label><label className="check"><input type="checkbox" name="lan" defaultChecked={a.allowLan} disabled={busy} />允许局域网访问</label><button disabled={busy}>保存设置</button></div><p className="notice">默认监听 127.0.0.1。开启网络访问后监听所有 IPv4 网卡，使用 HTTP，请仅用于可信网络；如需外网访问，请自行配置 HTTPS 与访问限制。修改端口或访问范围会中断当前 API 请求。</p></form></section>
+    <section className="box table-shell"><div className="bar table-footer"><div><h3>开放模型</h3><p className="notice">{a.modelIds === null ? '自动跟随已展示路由，包含动态免费模型。' : '仅开放手动选择的路由。'}</p></div><button disabled={busy} onClick={() => setModels(true)}>选择开放模型</button></div><div className="scroll" role="region" aria-label="API 开放模型" tabIndex="0"><table className="table"><thead><tr><th>模型名称</th><th>调用模型 ID</th></tr></thead><tbody>{a.models.map(m => <tr key={m.id}><td>{m.name}</td><td className="mono" style={{ overflowWrap: 'anywhere' }}>{m.id}</td></tr>)}</tbody></table>{!a.models.length && <p className="empty">暂未开放模型，请展示路由或手动选择。</p>}</div></section>
+    <details><summary>接口与统计说明</summary><p className="notice">支持 GET /v1/models、POST /v1/chat/completions（流式与普通 JSON），沿用路由的推理默认值，可用 reasoning_effort 覆盖。工具调用与图片能力取决于目标模型；外部工具自行执行工具并回传结果。用量记录到 Token 明细的「API 服务」来源，不保存请求内容或 Key；上下文由调用客户端传入。此版本不提供 Responses、Embeddings 或跨站浏览器 CORS 接口。启用状态会保存，DSH 下次启动自动恢复；退出 DSH 后停止。</p></details>
+    {confirmKey && <Modal title={confirmKey === 'create' ? '重置 API Key' : '撤销 API Key'} busy={busy} close={() => setConfirmKey(null)}><div className="modal-body stack"><p>{confirmKey === 'create' ? '旧 Key 将立即失效，其他客户端需要填写新 Key。' : 'Key 将立即失效，API 服务会关闭，正在处理的 API 请求将中断。'}</p></div><div className="modal-foot row"><button disabled={busy} onClick={() => setConfirmKey(null)}>取消</button><button className="primary" disabled={busy} onClick={() => { void keyAction(`api.key.${confirmKey}`); }}>确认{confirmKey === 'create' ? '重置' : '撤销'}</button></div></Modal>}
+    {models && <Modal title="选择 API 开放模型" busy={busy} close={() => setModels(false)}><ApiModels data={a} busy={busy} save={async modelIds => { if (await save({ modelIds })) setModels(false); }} /></Modal>}
+    {example && <Modal title="接入示例 / 手动复制" busy={false} close={() => setExample('')}><div className="modal-body stack"><p className="notice">将 YOUR_API_KEY 替换为自己的服务 Key。Base URL 已包含 /v1；测试调用会正常消耗目标账号的用量。</p><label>可复制内容<textarea className="mono" readOnly rows={8} value={example} onFocus={e => e.currentTarget.select()} /></label></div></Modal>}
+  </div>;
+}
+function ApiModels({ data, busy, save }) {
+  const [follow, setFollow] = useState(data.modelIds === null), [selected, setSelected] = useState(data.modelIds ?? data.models.map(m => m.id));
+  return <form onSubmit={e => { e.preventDefault(); void save(follow ? null : selected); }}><div className="modal-body stack"><label className="check"><input type="checkbox" checked={follow} disabled={busy} onChange={e => setFollow(e.target.checked)} />跟随路由展示（新发现的免费模型也自动开放）</label><div className="row"><button type="button" disabled={busy || follow} onClick={() => setSelected(data.choices.map(m => m.id))}>全选</button><button type="button" disabled={busy || follow} onClick={() => setSelected([])}>全不选</button></div>{data.choices.map(m => <label className="check" key={m.id}><input type="checkbox" disabled={busy || follow} checked={follow ? m.visible : selected.includes(m.id)} onChange={e => setSelected(e.target.checked ? [...selected, m.id] : selected.filter(id => id !== m.id))} /><span>{m.name}<small className="mono muted" style={{ overflowWrap: 'anywhere' }}>{m.id}</small></span></label>)}{!data.choices.length && <p className="notice">请先添加路由。</p>}</div><div className="modal-foot row"><button className="primary" disabled={busy}>保存开放范围</button></div></form>;
+}
+
+export function ModelsPanel({ error = '', notice = '', data, provider, providerSelect, search, setSearch, busy, act }) {
+  const [editing, setEditing] = useState(null), [testing, setTesting] = useState(null), [testResult, setTestResult] = useState(null);
+  const models = data.providers.find(p => p.id === provider)?.models ?? [];
+  const all = data.providers.flatMap(p => p.models), shown = models.filter(m => `${m.id} ${m.name}`.toLowerCase().includes(search.toLowerCase()));
+  return <div className="stack"><div className="bar"><div><h3>原始模型展示</h3><p className="notice">已展示 {all.filter(m => m.visible).length} / {all.length} 个 · 默认仅展示统一路由</p></div><div className="row"><button disabled={busy} onClick={() => { void act({ action: 'models.visibility', visible: true }); }}>全部展示</button><button disabled={busy} onClick={() => { void act({ action: 'models.visibility', visible: false }); }}>全部隐藏（仅路由）</button></div></div>
+    <div className="bar toolbar"><div className="row">{providerSelect}<label className="search">搜索模型<input type="search" placeholder="名称或模型 ID" value={search} onChange={e => setSearch(e.target.value)} /></label></div><button disabled={busy} onClick={() => { void act({ action: 'refresh', provider }); }}>获取模型目录</button></div>
+    <section className="box table-shell"><div className="scroll" role="region" aria-label="模型展示管理" tabIndex="0"><table className="table model-table"><thead><tr><th scope="col">模型</th><th scope="col">上下文 / 推理</th><th scope="col">选择器展示</th><th scope="col" className="cell-actions">管理</th></tr></thead><tbody>{shown.map(m => <tr key={m.id} className={m.visible ? 'selected' : ''}><td><strong>{m.name}</strong><small className="mono muted">{m.id}</small></td><td>{capacity(m.contextWindow)}<small className="muted">最大 {capacity(m.maxContextWindow ?? m.contextWindow)} · 输出 {capacity(m.maxTokens)}{m.supportsImages ? " · 图片" : ""}</small><small className="muted">{m.reasoning?.supportedEfforts?.length ? m.reasoning.supportedEfforts.map(e => effortNames[e] || e).join(' / ') : '平台默认'}</small></td><td><label className="check"><input type="checkbox" aria-label={`展示 ${m.name}`} disabled={busy} checked={m.visible} onChange={e => { void act({ action: 'model.update', provider, id: m.id, visible: e.target.checked }); }} />{m.visible ? '已展示' : '已隐藏'}</label></td><td className="cell-actions"><button disabled={busy} onClick={() => setEditing({ id: m.id, name: m.name, provider, contextWindow: m.configuredContextWindow ?? null, supportsImages: m.supportsImages, reasoningEffort: m.configuredEffort ?? null })}>设置</button><button disabled={busy} onClick={() => { setTesting(m); setTestResult(null); }}>测试</button></td></tr>)}</tbody></table>{!shown.length && <p className="empty">{models.length ? '没有匹配的模型。' : '添加并启用账号后，获取模型目录。'}</p>}</div><div className="table-footer"><p className="notice">上下文默认最大，可在设置中调低；原始模型与路由预算独立。隐藏不影响路由或已有会话。</p></div></section>
+    {editing && <Modal title="模型设置" busy={busy} close={() => setEditing(null)}><ModelSettings error={error} notice={notice} model={models.find(m => m.id === editing.id)} draft={editing} setDraft={setEditing} busy={busy} save={async () => { if (await act({ action: 'model.update', ...editing })) setEditing(null); }} /></Modal>}
+    {testing && <Modal title={`测试 ${testing.name}`} busy={busy} close={() => { setTesting(null); setTestResult(null); }}><div className="modal-body stack"><Feedback error={error} notice={notice} /><p className="steps">发送一条简短请求，正常消耗目标账号的用量。此测试仅检查连通性，不代表已验证满上下文或图片识别能力。</p>{testResult && <p role="status" className={testResult.ok ? 'good' : 'warn'}>{testResult.ok ? `可用 · ${testResult.elapsedMs} ms` : `测试失败（HTTP ${testResult.status}）· ${testResult.hint}`}</p>}</div><div className="modal-foot row"><button disabled={busy} onClick={async () => { setTestResult(null); const result = await act({ action: 'model.test', provider, id: testing.id }); if (result) setTestResult(result.modelTest); }}>{busy ? '正在测试…' : '开始测试'}</button></div></Modal>}
+  </div>;
+}
+const capacity = n => n >= 1000000 && n % 1000000 === 0 ? `${n / 1000000}M` : `${fmt(n / 1000)}K`;
+export function ContextSelect({ model, value, onChange, disabled, label = '上下文预算' }) {
+  const max = model.maxContextWindow ?? model.contextWindow;
+  const choices = [...new Set([model.defaultContextWindow, ...(model.supportedContextWindows ?? []), 200000, 300000, 500000, 600000, value].filter(n => Number.isSafeInteger(n) && n > 0 && n <= max))].sort((a, b) => a - b);
+  return <label>{label}<select aria-label={label} disabled={disabled} value={value ?? ''} onChange={e => onChange(e.target.value ? Number(e.target.value) : null)}><option value="">最大容量 · {capacity(max)}（默认）</option>{choices.map(n => <option key={n} value={n}>{capacity(n)}{n === model.defaultContextWindow ? ' · 渠道默认' : ' · 本地预算'}</option>)}</select></label>;
+}
+export function ModelSettings({ error = '', notice = '', model, draft, setDraft, busy, save }) {
+  const set = (key, value) => setDraft(d => ({ ...d, [key]: value }));
+  return <form onSubmit={e => { e.preventDefault(); void save(); }}><div className="modal-body stack"><Feedback error={error} notice={notice} /><label>模型名称<input autoFocus required maxLength={200} disabled={busy} value={draft.name} onChange={e => set('name', e.target.value)} /></label><p className="mono muted">{model.id}</p><ContextSelect model={model} value={draft.contextWindow} disabled={busy} onChange={n => set('contextWindow', n)} /><p className="notice">最大上下文 {capacity(model.maxContextWindow)} · 最大输出 {capacity(model.maxTokens)}。手动预算只调低 DSH 的会话压缩阈值；请求使用能够容纳该预算的渠道档位。</p><label className="check"><input type="checkbox" disabled={busy || !model.imageCapable} checked={draft.supportsImages} onChange={e => set('supportsImages', e.target.checked)} />图片输入{!model.imageCapable && '（渠道未声明支持）'}</label><label>默认推理等级<select disabled={busy} value={draft.reasoningEffort ?? ''} onChange={e => set('reasoningEffort', e.target.value || null)}><option value="">平台默认</option>{model.reasoning?.supportedEfforts?.map(e => <option key={e} value={e}>{effortNames[e] || e}</option>)}</select></label><p className="notice">关闭思考仅在渠道声明支持时提供。会话中的手动选择优先于此默认值。</p></div><div className="modal-foot row"><button className="primary" disabled={busy}>保存并生效</button></div></form>;
+}
+export function RoutesTable({ data, busy, act, edit }) {
+  return <section className="box table-shell"><div className="scroll" role="region" aria-label="模型路由规则" tabIndex="0"><table className="table route-table"><thead><tr><th scope="col">路由 / 模型</th><th scope="col">账号与渠道</th><th scope="col">切换规则</th><th scope="col">展示</th><th scope="col" className="cell-actions">管理</th></tr></thead><tbody>{data.routes.map(r => {
+    const accounts = data.accounts.filter(a => a.enabled !== false && (!r.eligibleAccountIds || r.eligibleAccountIds.includes(a.id)) && r.targets.some(t => t.provider === a.provider && (!t.account || t.account === a.id)));
+    const providers = [...new Set(r.targets.map(t => data.providers.find(p => p.id === t.provider)?.name || t.provider))];
+    const cooling = r.expiringStatus?.cooldownUntil > Date.now(), modes = r.reasoning?.supportedEfforts ?? [];
+    return <tr key={r.id} className={r.visible !== false ? 'selected' : ''}><td><strong>{r.name}</strong><small className="muted">{r.contextKnown === false ? '等待模型目录' : `${capacity(r.contextWindow)} 上下文 · ${r.contextMode === 'custom' ? '自定义预算' : '默认最大'}`}</small><small className="muted">{r.freeOnly ? `${r.freeStatus?.modelRoutes?.filter(m => m.selected).length || 0} 个免费模型已展示` : modes.length ? `推理：${modes.map(e => effortNames[e] || e).join(' / ')}` : '推理：平台默认'}</small></td><td className="route-targets">{accounts.length} 个参与账号<small className="muted">{providers.join('、')}</small></td><td>{r.freeOnly ? '仅免费 · 自动发现' : strategies[r.strategy || 'failover']}<small className={cooling ? 'warn' : 'muted'}>{cooling ? '临期优先冷却中' : r.preferExpiringCredits ? '临期积分优先' : `${r.targets.length} 个目标 · 4xx 切换`}</small></td><td><label className="check"><input type="checkbox" aria-label={`展示路由 ${r.name}`} disabled={busy} checked={r.visible !== false} onChange={e => { const { id, reasoning, supportsImages, expiringStatus, freeStatus, maxContextWindow, supportedContextWindows, configuredContextWindow, contextKnown, eligibleAccountIds, enforceContext, ...route } = r; void act({ action: 'route.save', id, previousId: id, route: { ...route, visible: e.target.checked } }); }} />{r.visible !== false ? '开启' : '关闭'}</label></td><td className="cell-actions"><button disabled={busy} onClick={() => edit(r)}>{r.freeOnly ? '管理免费模型' : '编辑路由'}</button></td></tr>;
+  })}</tbody></table>{!data.routes.length && <p className="empty">添加模型预配置，或创建自定义路由。</p>}</div></section>;
+}
+
+const displayName = a => (a?.name || a?.id || '未知账号').replace(/(?<!\d)(\+?\d{2,3})\d{3,8}(\d{4})(?!\d)/g, '$1****$2');
+const resultLabels = { claimed: '签到成功', 'already-claimed': '已领取', 'no-campaign': '无活动', retryable: '查询失败', 'before-window': '窗口未开', 'auth-invalid': '令牌失效', paused: '平台暂停', uncertain: '待核对', 'device-used': '设备已参与' };
+function Balance({ account }) {
+  const b = account.usage?.balance, now = Date.now();
+  const expiring = b?.unit === 'credits' && !b.error ? (b.packages || []).filter(p => Number.isFinite(p.remaining) && p.remaining > 0 && p.expiresAt > now && p.expiresAt <= now + 3 * 86400000).reduce((n, p) => n + p.remaining, 0) : 0;
+  return <><div className="amount">{b?.unlimited ? '不限量' : fmt(b?.remaining)}{b?.unit === 'credits' && <small className="muted" style={{ display: 'inline', marginLeft: 5 }}>积分</small>}</div>
+    <small className={b?.error ? 'error' : expiring ? 'warn' : 'muted'}>{b?.error ? '查询失败 · 保留上次余额' : expiring ? `${fmt(expiring)} 积分 3 天内到期` : b?.fetchedAt ? `更新于 ${when(b.fetchedAt)}` : '等待刷新平台用量'}</small></>;
+}
+function CheckinResult({ row, compact = false }) {
+  const last = row?.last, today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  const current = last?.day === today;
+  return <><span className={current && ['claimed', 'already-claimed'].includes(last.status) ? 'good' : last && ['auth-invalid', 'paused', 'uncertain', 'retryable'].includes(last.status) ? 'warn' : 'muted'}>{!row?.supported ? '暂不支持' : current || last?.status === 'auth-invalid' ? resultLabels[last.status] || '已处理' : '今日未签到'}</span>
+    {(!compact || current && last.amount !== undefined) && <small className="muted">{current && last.amount !== undefined ? `本次 ${fmt(last.amount)} 积分` : row?.auto ? '自动签到已开启' : '自动签到未开启'}</small>}</>;
+}
+export function AccountPool({ data, provider, providerSelect, busy, act, manage, add }) {
+  const [search, setSearch] = useState('');
+  const accounts = data.accounts.filter(a => !provider || a.provider === provider), chosen = accounts.filter(a => a.enabled !== false).length;
+  const visible = accounts.filter(a => `${a.name} ${a.id}`.toLowerCase().includes(search.toLowerCase()));
+  const rows = data.checkins?.accounts || [], eligible = rows.filter(r => accounts.some(a => a.id === r.id && a.enabled !== false) && r.ready);
+  const setAll = enabled => { void act({ action: 'accounts.enabled', ...(provider ? { provider } : {}), enabled }); };
+  return <div className="stack"><div className="bar"><div><h3 className="section-title">账号池</h3><p className="muted">{accounts.length} 个账号 · {chosen} 个参与路由</p></div><button className="primary" disabled={busy} onClick={add}>添加账号</button></div>
+    <div className="bar toolbar"><div className="row">{providerSelect}<label className="search">搜索账号<input type="search" value={search} placeholder="名称或账号 ID" onChange={e => setSearch(e.target.value)} /></label></div><div className="row">{!provider?.startsWith('qoder') && <button disabled={busy} onClick={() => { void act({ action: 'accounts.discover', ...(provider ? { provider } : {}) }); }}>获取本机登录</button>}<button disabled={busy} onClick={() => { void act({ action: 'monitor.refresh', ...(provider ? { provider } : {}) }); }}>刷新状态与用量</button></div></div>
+    <div className="bar"><p className="hint">勾选的账号参与路由；自动签到在「积分签到」中单独设置。</p><div className="row"><span className="notice">已选 {chosen} / {accounts.length}</span><button disabled={busy || !accounts.length || chosen === accounts.length} onClick={() => setAll(true)}>全选</button><button disabled={busy || !chosen} onClick={() => setAll(false)}>全不选</button><button disabled={busy || data.checkins?.running || data.checkins?.error || !eligible.length} onClick={() => { void act({ action: 'checkins.run', ids: eligible.map(r => r.id) }); }}>签到可用账号（{eligible.length}）</button></div></div>
+    <section className="box table-shell"><div className="scroll" role="region" aria-label="账号池列表" tabIndex="0"><table className="table"><thead><tr><th scope="col">账号 / 路由参与</th><th scope="col">平台积分</th><th scope="col">模型与调用</th><th scope="col">今日签到</th><th scope="col" className="cell-actions">管理</th></tr></thead><tbody>{visible.map(a => { const cooldown = a.status?.cooldowns || [], active = a.status?.activeFor?.length, enabled = a.enabled !== false;
+      return <tr key={a.id} className={enabled ? 'selected' : ''}><td><div className="account-cell"><label className="check account-check"><input aria-label={`${displayName(a)} 参与路由`} type="checkbox" disabled={busy} checked={enabled} onChange={e => { void act({ action: 'account.update', id: a.id, enabled: e.target.checked }); }} /></label><div className="account-name"><strong>{displayName(a)}</strong>{!provider && <small className="muted">{data.providers?.find(p => p.id === a.provider)?.name || a.provider}</small>}<small><span className="status"><i className={!enabled ? '' : cooldown.length ? 'warn' : 'good'} aria-hidden="true" />{!enabled ? '未入池' : active ? '正在调用' : cooldown.length ? '部分路由冷却中' : '已在池中'}</span></small><small className="muted">{loginNames[a.login?.state] || '尚未查询登录'}</small></div></div></td>
+        <td><Balance account={a} /></td><td><span>{fmt(a.modelCount || 0)} 个目录模型</span><small className="muted">{fmt(a.usage?.requests || 0)} 次调用 · {fmt(a.usage?.tokens || 0)} Token</small>{cooldown.length > 0 && <small className="warn">最长约 {Math.ceil(Math.max(...cooldown.map(c => c.remainingMs)) / 60000)} 分钟后恢复</small>}</td><td><CheckinResult row={rows.find(r => r.id === a.id)} /></td><td className="cell-actions"><button disabled={busy} onClick={() => manage(a)}>管理账号</button></td></tr>;
+    })}</tbody></table>{!visible.length && <p className="empty">{accounts.length ? '没有匹配的账号，请调整搜索。' : '还没有账号，点击「添加账号」获取登录或填写凭证。'}</p>}</div></section>
+    <details className="help"><summary>本机账号获取与凭证说明</summary><div className="stack"><p className="notice">WorkBuddy 与 Trae 启动时自动读取本机已登录账号，每分钟重新检测；Trae 自动识别 CN、Global 与 SOLO。也可添加手动凭证或导入其它设备账号，各账号独立保存。Qoder 需添加 PAT。</p>{data.localDiscovery?.filter(s => !provider || s.provider === provider).map(s => <p className="notice" key={s.provider}>{data.providers?.find(p => p.id === s.provider)?.name || s.provider} · {s.state === 'found' ? '已发现本机客户端登录。' : s.state === 'unreadable' ? '无法读取本机登录文件，请在官方客户端重新登录，或手动填写凭证。' : '未找到本机登录，请先登录对应区域的官方客户端。'} · {when(s.checkedAt)}</p>)}</div></details>
+  </div>;
+}
+export function CheckinPanel({ data, busy, act }) {
+  const info = data.checkins || {}, rows = info.accounts || [], today = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  const saved = info.settings ?? { mode: 'scheduled', time: '10:05' };
+  const [schedule, setSchedule] = useState(saved);
+  useEffect(() => { setSchedule(saved); }, [saved.mode, saved.time]);
+  const changed = schedule.mode !== saved.mode || schedule.time !== saved.time;
+  const blocked = busy || info.running || !!info.error;
+  const eligible = rows.filter(r => r.supported && !r.paused && data.accounts.find(a => a.id === r.id)?.enabled && r.ready === true);
+  const ready = r => eligible.includes(r);
+  return <div className="stack"><section className="box stack"><div className="bar"><div><h3>每日积分签到</h3><p className="notice">{info.schedule}</p><p className="notice">自动签到默认关闭，请在下方逐个开启。</p></div><button className="primary" disabled={blocked || !eligible.length} onClick={() => { void act({ action: 'checkins.run', ids: eligible.map(r => r.id) }); }}>签到全部可用账号（{eligible.length}）</button></div>
+    <form className="row plan-form" onSubmit={e => { e.preventDefault(); void act({ action: 'checkins.settings', schedule }); }}><label className="filter">自动签到方式<select aria-label="自动签到方式" value={schedule.mode} disabled={blocked} onChange={e => setSchedule({ ...schedule, mode: e.target.value })}><option value="startup">每日启动时签到</option><option value="scheduled">每天定时签到</option></select></label>{schedule.mode === 'scheduled' && <label className="filter">签到时间（北京时间）<input aria-label="签到时间（北京时间）" type="time" required value={schedule.time} disabled={blocked} onChange={e => setSchedule({ ...schedule, time: e.target.value })} /></label>}<button disabled={blocked || !changed}>保存签到计划</button></form>
+    <details className="help"><summary>执行规则、补查与设备限制</summary><div className="stack">    <p className="notice">自动签到默认关闭，按账号开启。先查领取状态、串行提交，账号间隔至少 10 秒；每个账号每天最多提交一次领取。确认尚未提交的查询失败，20:05 后最多补查一次；已领取、无活动和结果不明的账号跳过。遇到验证、限流或设备限制就停止，不会修改设备身份或切换账号重试。</p>
+    <p className="notice">启动模式在当天首次运行时执行，持续运行则新一天自动执行；定时模式在设定时间后执行，错过时下次启动补查。Qoder 最早北京时间 10:05 查询当日活动。DSH 关闭期间不执行，运行时约一分钟内触发。修改计划、刷新面板或重启不会清除已处理记录；令牌失效后请更新凭证再恢复。</p>
+</div></details>
+    {info.error && <p role="alert" className="error">{info.error}</p>}
+    <p role="status">{info.running ? `正在处理 ${displayName(data.accounts.find(a => a.id === info.current)) || '签到队列'}…` : '签到结果和领取积分以下方平台响应为准。'}</p>
+    {info.report && <p className="notice">最近一轮 · {when(info.report.at)} · {Object.entries(info.report.counts || {}).map(([key, n]) => `${resultLabels[key] || '未完成'} ${n}`).join(' · ')}。没有待补查账号时不重复汇报。</p>}
+  </section>
+  {data.providers.map(p => {
+    const accounts = data.accounts.filter(a => a.provider === p.id);
+    if (!accounts.length) return null;
+    const supported = rows.some(r => r.id === accounts[0].id && r.supported), paused = rows.some(r => accounts.some(a => a.id === r.id) && r.paused);
+    return <section className="box stack" key={p.id}><div className="bar"><h3>{p.name}</h3><span className="badge">{supported ? paused ? '已暂停' : '支持签到' : '官方客户端领取'}</span></div>
+      {!supported ? <p className="notice">{p.id.startsWith('workbuddy') ? 'WorkBuddy AI 暂未接入可核验的签到接口，请在官方客户端查看活动与领取入口。' : 'Trae Global 暂无已核验的积分签到接口，请在官方客户端查看权益。'}</p> : <>
+        {paused && <div className="steps"><p>平台限制或需要验证，已暂停该平台签到。请在官方客户端处理后再恢复；恢复仍保留今日尝试记录和设备限制。</p><button disabled={blocked} onClick={() => { void act({ action: 'checkins.resume', provider: p.id }); }}>我已在官方客户端处理，恢复后续签到</button></div>}
+        <div className="scroll" role="region" aria-label={`${p.name} 签到记录`} tabIndex="0"><table className="table"><thead><tr><th scope="col">账号</th><th scope="col">自动签到</th><th scope="col">今日结果</th><th scope="col">最近记录</th><th scope="col" className="cell-actions">操作</th></tr></thead><tbody>{accounts.map(a => { const r = rows.find(r => r.id === a.id) || {}, last = r.last?.day === today ? r.last : undefined; return <tr key={a.id} className={info.current === a.id ? 'selected' : ''}><td><strong>{displayName(a)}</strong><small className="muted">{a.enabled === false ? '账号已停用' : '已在账号池中'}</small></td><td><label className="check"><input aria-label={`${displayName(a)} 每日自动签到`} type="checkbox" disabled={blocked} checked={r.auto === true} onChange={e => { void act({ action: 'account.update', id: a.id, autoCheckin: e.target.checked }); }} />每日自动签到</label></td><td><CheckinResult row={r} compact /></td><td><small className="muted">{r.last ? when(r.last.at) : '尚无记录'}</small><small className="muted">{r.last?.message || '等待首次签到'}</small>{last?.retryAt && <small className="warn">补查时间 {when(last.retryAt)}</small>}{r.last?.activity && <details><summary>活动详情</summary><small className="muted">{[r.last.activity.streakDays !== undefined && `连签 ${fmt(r.last.activity.streakDays)} 天`, r.last.activity.totalCredits !== undefined && `活动累计 ${fmt(r.last.activity.totalCredits)} 积分`, r.last.activity.nextStreakDay !== undefined && `下一连签档位 ${fmt(r.last.activity.nextStreakDay)} 天`, r.last.activity.endsAt !== undefined && `活动截止 ${when(r.last.activity.endsAt)}`].filter(Boolean).join(' · ')}</small></details>}</td><td className="cell-actions">{p.id === 'workbuddy' && r.last?.status === 'auth-invalid' ? <button disabled={blocked} onClick={() => { void act({ action: 'checkins.verify', id: a.id }); }}>重新验证登录</button> : <button disabled={blocked || !ready(r)} onClick={() => { void act({ action: 'checkins.run', ids: [a.id] }); }}>{r.last?.status === 'auth-invalid' ? '请更新凭证' : last?.retryReady ? '补查签到' : last?.retryAt ? '等待晚间补查' : last ? '今日已处理' : '立即签到'}</button>}</td></tr>; })}</tbody></table></div>
+      </>}
+    </section>;
+  })}
+  {!data.accounts.length && <p className="box empty">先到「账号与登录」添加账号，再开启每日自动签到。</p>}
+  <p className="notice">多台设备的本地记录不会互相同步，每次都会查询平台领取状态；建议仅在一台常用设备开启自动签到。同一 Trae 设备每天最多处理一个领取请求，重复账号副本会去重；不保证平台一定发放奖励。</p>
+  </div>;
+}
+function Overview({ data, busy, act, go }) {
+  const t = data.telemetry || {}, today = t.days?.[t.today] || {}, totals = data.accounts.reduce((s, a) => ({ requests: s.requests + (a.usage?.requests || 0), tokens: s.tokens + (a.usage?.tokens || 0) }), { requests: 0, tokens: 0 });
+  const dates = Array.from({ length: 7 }, (_, i) => { const d = new Date(); d.setDate(d.getDate() - 6 + i); const key = d.toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }); return { key, tokens: t.days?.[key]?.tokens || 0 }; });
+  const max = Math.max(1, ...dates.map(d => d.tokens));
+  return <div className="stack"><div className="metrics">{metric('今日 Token', fmt(today.tokens || 0), '输入 + 输出 · 北京时间')}{metric('今日请求', fmt(today.requests || 0), `失败 ${fmt(today.failures || 0)} 次`)}{metric('账号池', `${data.accounts.filter(a => a.enabled).length} / ${data.accounts.length}`, '启用 / 全部账号')}{metric('累计 Token', fmt(totals.tokens), `${fmt(totals.requests)} 次请求`)}</div>
+    <PerformanceMetrics events={(t.events || []).filter(e => e.at >= usageDateBounds('1')[0])} />
+    <div className="bar"><h3>平台额度</h3><div className="row"><span className="notice">平台用量 · 每 5 分钟更新</span><button disabled={busy} onClick={() => { void act({ action: 'monitor.refresh' }); }}>刷新平台用量</button></div></div>
+    <section className="box table-shell"><div className="scroll" role="region" aria-label="各平台账号额度" tabIndex="0"><table className="table"><thead><tr><th scope="col">账号</th><th scope="col">供应商 / 区域</th><th scope="col">平台积分</th><th scope="col">今日签到</th><th scope="col" className="cell-actions">路由状态</th></tr></thead><tbody>{data.accounts.map(a => <tr key={a.id}><td><strong>{displayName(a)}</strong><small className="muted">{loginNames[a.login?.state] || '尚未查询登录'}</small></td><td>{data.providers.find(p => p.id === a.provider)?.name || a.provider}</td><td><Balance account={a} /></td><td><CheckinResult row={data.checkins?.accounts.find(r => r.id === a.id)} /></td><td className="cell-actions"><span className="status"><i className={a.enabled === false ? '' : a.status?.cooldowns?.length ? 'warn' : 'good'} aria-hidden="true" />{a.enabled === false ? '未入池' : a.status?.cooldowns?.length ? '部分路由冷却' : '已在池中'}</span></td></tr>)}</tbody></table>{!data.accounts.length && <p className="empty">尚未连接账号，请先获取本机登录或添加凭证。</p>}</div><div className="table-footer bar"><p className="notice">各平台积分独立展示，临期提醒仅显示已确认的余额。</p><button disabled={busy} onClick={() => go('accounts')}>管理账号池</button></div></section>
+    <p className="notice">面板读取本机缓存，不会触发平台查询。平台余额每 5 分钟更新，手动刷新立即查询；积分轮换与临期优先按需复核。Token 仅统计本插件请求。</p>
+    <div className="grid"><section className="box"><h3>近 7 日 Token</h3><div className="trend" role="img" aria-label={dates.map(d => `${d.key} ${d.tokens} Token`).join('，')}>{dates.map(d => <div key={d.key} title={`${d.key} · ${fmt(d.tokens)} Token`}><i style={{ height: `${Math.max(3, d.tokens / max * 78)}%` }} /><small>{d.key.slice(5)}</small></div>)}</div><p className="notice">未返回 Token 用量的请求：{fmt(data.accounts.reduce((n, a) => n + (a.usage?.unmetered || 0), 0))} 次</p></section>
+      <section className="box stack"><h3>常用入口</h3><p className="notice">连接账号后，在 DSH 模型选择器中使用「统一路由」。</p><div className="row"><button onClick={() => go('accounts')}>查看账号</button><button onClick={() => go('routes')}>配置路由</button><button onClick={() => go('checkins')}>积分签到</button><button onClick={() => go('plugins')}>检查所有插件更新</button></div></section></div>
+    <section className="box"><div className="bar"><h3>最近请求</h3><button onClick={() => go('usage')}>查看 Token 明细</button></div><div className="scroll"><table className="table"><thead><tr><th>时间</th><th>账号</th><th>路由 / 模型</th><th>Token</th><th>性能</th><th>结果</th></tr></thead><tbody>{(t.events || []).slice(0, 15).map((e, i) => <tr key={`${e.at}:${i}`}><td>{when(e.at)}</td><td>{data.accounts.find(a => a.id === e.account)?.name || e.account}</td><td className="mono">{e.alias}</td><td>{fmt(e.tokens)}</td><td><RequestPerformance event={e} /></td><td>{e.outcome === 'completed' ? '成功' : e.outcome === 'cancelled' ? '已取消' : `失败 ${e.status}`}</td></tr>)}</tbody></table>{!t.events?.length && <p className="empty">尚无请求记录。通过本插件调用模型后会显示在这里。</p>}</div></section>
+  </div>;
+}
+export function usageDateBounds(period, start, end, now = Date.now()) {
+  const today = new Date(now).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' });
+  const midnight = day => Date.parse(`${day}T00:00:00+08:00`);
+  if (period === 'custom') return [midnight(start), midnight(end) + 86400000];
+  if (period === 'all') return [-Infinity, Infinity];
+  return [midnight(today) - (Number(period) - 1) * 86400000, midnight(today) + 86400000];
+}
+export const duration = ms => typeof ms !== 'number' || !Number.isFinite(ms) ? '—' : ms < 60000 ? `${fmt(ms / 1000)} 秒` : `${Math.floor(ms / 60000)} 分 ${fmt(ms % 60000 / 1000)} 秒`;
+export function performanceSummary(events) {
+  const rows = events.filter(e => e.outcome === 'completed' && e.timing);
+  const sum = (key, source = rows) => source.some(e => e.timing[key] != null) ? source.reduce((n, e) => n + (e.timing[key] ?? 0), 0) : null;
+  const first = rows.filter(e => e.timing.ttftMs != null), decode = rows.filter(e => e.timing.decodeMs > 0 && e.timing.decodeTokens != null), tools = rows.filter(e => e.timingSource === 'dsh-step');
+  return { modelMs: sum('modelMs'), toolMs: sum('toolMs', tools), ttftMs: first.length ? sum('ttftMs', first) / first.length : null,
+    tps: decode.length ? sum('decodeTokens', decode) / (sum('decodeMs', decode) / 1000) : null,
+    samples: rows.length, firstSamples: first.length, decodeSamples: decode.length, toolSamples: tools.length,
+    pendingTools: tools.reduce((n, e) => n + (e.timing.toolCount ?? 0) - (e.timing.toolsCompleted ?? 0), 0) };
+}
+function PerformanceMetrics({ events }) {
+  const stats = performanceSummary(events);
+  return <section className="stack performance" aria-label="调用性能统计"><div className="bar"><h3>调用性能</h3><p className="notice">成功调用 · {fmt(stats.samples)} 条性能记录</p></div><div className="metrics">
+    {metric('模型用时', duration(stats.modelMs), '成功调用用时合计')}{metric('工具调用用时', duration(stats.toolMs), `${stats.toolSamples} 条 DSH 步骤${stats.pendingTools ? ` · ${stats.pendingTools} 个工具未完成` : ''}`)}
+    {metric('首 Token 平均（TTFT）', duration(stats.ttftMs), `${stats.firstSamples} 条首 Token 记录`)}{metric('输出速度（TPS）', stats.tps === null ? '—' : `${fmt(stats.tps)} tok/s`, `${stats.decodeSamples} 条解码记录 · 加权速度`)}</div>
+    <details className="help"><summary>统计口径与缺失数据</summary><div><p className="notice">随当前时间、账号、路由和结果筛选汇总，从本版开始记录；旧数据不补算。DSH 步骤口径与会话统计一致：模型用时从步骤开始到回复完成，首 Token 包括非空文本、推理或工具调用，工具用时按调用与结果配对相加（并行工具可能重叠）。TPS = 有效输出 Token 合计 ÷ 首 Token 后的解码秒数合计，不对各次速度简单平均。未经过 DSH 步骤的请求使用上游计时，无法记录工具执行用时。这里只汇总本插件保留且筛选内的调用，并非某个会话的完整历史。失败与取消保留逐次耗时，不计入以上成功调用指标。</p></div></details></section>;
+}
+export function UsageDetails({ data, busy, act }) {
+  const [account, setAccount] = useState(''), [route, setRoute] = useState(''), [outcome, setOutcome] = useState(''), [source, setSource] = useState(''), [page, setPage] = useState(0);
+  const [period, setPeriod] = useState('30'), [start, setStart] = useState(() => new Date(Date.now() - 29 * 86400000).toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' })), [end, setEnd] = useState(() => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Shanghai' }));
+  const all = data.telemetry?.events || [], retention = data.options.usageRetentionDays;
+  const [from, until] = usageDateBounds(period, start, end), invalidRange = !(from < until);
+  const events = all.filter(e => e.at >= from && e.at < until && (!account || e.account === account) && (!route || e.alias === route) && (!outcome || e.outcome === outcome) && (!source || (e.source || 'dsh') === source));
+  const pages = Math.max(1, Math.ceil(events.length / 50)), current = Math.min(page, pages - 1);
+  const accountName = id => data.accounts.find(a => a.id === id)?.name || id;
+  const routeName = id => data.routes.find(r => r.id === id)?.name || id;
+  const total = key => events.some(e => e[key] != null) ? events.reduce((n, e) => n + (e[key] ?? 0), 0) : null;
+  const missing = events.filter(e => e.input == null || e.output == null).length;
+  return <div className="stack"><section className="box stack"><div className="bar"><div><h3>逐次请求用量</h3><p className="notice">记录每次上游调用，包括故障切换中失败的尝试。</p></div><span className="badge">最近 {retention} 天 · {fmt(all.length)} 条</span></div>
+    <details className="help"><summary>调整明细保留天数（当前 {retention} 天）</summary><div className="stack"><form key={retention} className="row" onSubmit={e => { e.preventDefault(); void act({ action: 'options.save', usageRetentionDays: Number(new FormData(e.currentTarget).get('days')) }); }}><label className="filter">明细保留天数<input name="days" type="number" min="1" max="365" step="1" required disabled={busy} defaultValue={retention} /></label><button type="submit" disabled={busy}>保存保留期限</button></form><p className="notice">默认滚动保留最近 30 天，可设置 1–365 天。缩短期限会删除超期明细，延长不能恢复已删除记录；累计统计、额度轮换和临期冷却不受影响。</p></div></details></section>
+    <div className="bar"><div className="row" role="group" aria-label="明细时间范围">{[['1', '今日'], ['3', '近 3 日'], ['7', '近 7 日'], ['30', '近 30 日'], ['all', '全部已保留'], ['custom', '自定义']].map(([value, label]) => <button key={value} aria-pressed={period === value} onClick={() => { setPeriod(value); setPage(0); }}>{label}</button>)}</div><p className="notice">按北京时间自然日筛选</p></div>
+    {period === 'custom' && <div className="row"><label className="filter">开始日期（北京时间）<input type="date" value={start} max={end || undefined} required onChange={e => { setStart(e.target.value); setPage(0); }} /></label><label className="filter">结束日期（北京时间）<input type="date" value={end} min={start || undefined} required onChange={e => { setEnd(e.target.value); setPage(0); }} /></label>{invalidRange && <p role="alert" className="error">请选择有效的起止日期，结束日期不能早于开始日期。</p>}</div>}
+    <div className="row"><label className="filter">账号<select value={account} onChange={e => { setAccount(e.target.value); setPage(0); }}><option value="">全部账号</option>{[...new Set(all.map(e => e.account))].map(id => <option key={id} value={id}>{accountName(id)}</option>)}</select></label><label className="filter">路由 / 模型<select value={route} onChange={e => { setRoute(e.target.value); setPage(0); }}><option value="">全部路由 / 模型</option>{[...new Set(all.map(e => e.alias))].map(id => <option key={id} value={id}>{routeName(id)}</option>)}</select></label><label className="filter">来源<select value={source} onChange={e => { setSource(e.target.value); setPage(0); }}><option value="">全部来源</option><option value="dsh">DSH 会话</option><option value="api">API 服务</option></select></label><label className="filter">结果<select value={outcome} onChange={e => { setOutcome(e.target.value); setPage(0); }}><option value="">全部结果</option><option value="completed">成功</option><option value="failed">失败</option><option value="cancelled">已取消</option></select></label></div>
+    <div className="metrics">{metric('筛选内调用', fmt(events.length), '上游尝试次数')}{metric('输入 Token', fmt(total('input')), '已返回的输入分项')}{metric('输出 Token', fmt(total('output')), '已返回的输出分项')}{metric('总 Token', fmt(total('tokens')), '已返回的总量')}</div><p className="notice">数据来自平台返回的 usage。{missing ? fmt(missing) + ' 条缺少输入或输出分项；旧记录不补算。' : '输入、输出为实际返回值。'}缓存输入包含在输入中，推理输出包含在输出中，均不重复相加。未返回的数据以「—」显示。</p>
+    <PerformanceMetrics events={events} />
+    <section className="box table-shell"><div className="scroll" role="region" aria-label="请求用量与性能明细" tabIndex="0"><table className="table"><thead><tr><th>时间</th><th>渠道 / 账号</th><th>路由 / 实际模型</th><th>输入</th><th>输出</th><th>总 Token</th><th>性能</th><th>结果</th></tr></thead><tbody>{events.slice(current * 50, (current + 1) * 50).map((e, i) => <tr key={e.at + ':' + current + ':' + i}><td>{when(e.at)}<small className="muted">{e.source === 'api' ? 'API 服务' : 'DSH 会话'}</small></td><td>{data.providers.find(p => p.id === e.provider)?.name || e.provider}<br /><small>{accountName(e.account)}</small></td><td>{routeName(e.alias)}<br /><small className="mono">{e.model || '未记录实际模型'}</small></td><td>{fmt(e.input)}{e.cachedInput != null && <><br /><small>缓存 {fmt(e.cachedInput)}</small></>}</td><td>{fmt(e.output)}{e.reasoningOutput != null && <><br /><small>推理 {fmt(e.reasoningOutput)}</small></>}</td><td>{fmt(e.tokens)}</td><td><RequestPerformance event={e} /></td><td>{e.outcome === 'completed' ? '成功' : e.outcome === 'cancelled' ? '已取消' : '失败'}<br /><small>{e.status}</small></td></tr>)}</tbody></table>{!events.length && <p className="empty">当前筛选和保留期限内没有请求明细。</p>}</div><div className="bar table-footer"><p className="notice">第 {current + 1} / {pages} 页 · 每页 50 条</p><div className="row"><button disabled={current === 0} onClick={() => setPage(current - 1)}>上一页</button><button disabled={current >= pages - 1} onClick={() => setPage(current + 1)}>下一页</button></div></div></section>
+  </div>;
+}
+function RequestPerformance({ event: e }) {
+  const t = e.timing;
+  if (!t) return <small>未记录</small>;
+  return <details className="help"><summary>{duration(t.modelMs)}</summary><div style={{ minWidth: 170 }}><small>模型：{duration(t.modelMs)}</small><small>首 Token：{duration(t.ttftMs)}</small><small>TPS：{t.decodeMs > 0 && t.decodeTokens != null ? `${fmt(t.decodeTokens / (t.decodeMs / 1000))} tok/s` : '—'}</small><small>工具：{duration(t.toolMs)}{t.toolCount != null ? ` · ${t.toolsCompleted} / ${t.toolCount} 完成` : ''}</small><small>{e.timingSource === 'dsh-step' ? 'DSH 步骤计时' : '上游请求计时'}</small></div></details>;
+}
+function AccountForm({ modal, provider, data, busy, act, close, replace, error, notice }) {
+  const [revision, setRevision] = useState(modal.revision);
+  const edit = modal.mode === 'edit', account = edit ? data.accounts.find(a => a.id === modal.account.id) : null;
+  return edit ? <div className="modal-body stack"><Feedback error={error} notice={notice} /><div className="box stack"><h3>{account.name}</h3><p>{loginNames[account.login?.state] || '尚未查询'}</p><p className="notice">账号身份：{account.login?.name || '尚未获取'}<br />认证方式：{account.login?.kind || '未知'}<br />登录有效至：{account.login?.kind === 'PAT' ? '平台未返回有效期' : when(account.login?.expiresAt)}<br />自动刷新：{account.login?.refreshable ? '支持' : '无刷新凭证'}<br />上次用量更新：{when(account.usage?.balance?.fetchedAt)}</p><button disabled={busy} onClick={() => { void act({ action: 'account.refresh', id: account.id }); }}>刷新登录与用量</button><button disabled={busy} onClick={replace}>补充 / 更新凭证</button></div>
+    <div className="bar"><div><h3>路由账号顺序</h3><p className="notice">故障切换按此顺序尝试；权重或额度策略以路由配置为准。</p></div><div className="row">{[-1, 1].map(direction => { const group = data.accounts.filter(a => a.provider === account.provider), i = group.findIndex(a => a.id === account.id); return <button type="button" key={direction} disabled={busy || (direction < 0 ? i === 0 : i === group.length - 1)} onClick={async () => { const next = await act({ action: 'account.move', id: account.id, direction }); if (next) setRevision(next.revision); }}>{direction < 0 ? '前移' : '后移'}</button>; })}</div></div>
+    <CredentialTransfer account={account} busy={busy} act={act} />
+    <section className="box"><h3>平台套餐与额度</h3>{account.usage?.balance?.plan && <p>{account.usage.balance.plan}</p>}{(account.usage?.balance?.packages || []).map((p, i) => <div className="item" key={i}><div className="bar"><span>{p.name || '额度包'}</span><strong>{p.unlimited ? '不限量' : `${fmt(p.remaining)} / ${fmt(p.total)}`}</strong></div>{p.expiresAt && <p className="notice">有效至 {when(p.expiresAt)}</p>}</div>)}{!account.usage?.balance?.packages?.length && <p className="notice">尚无可展示额度包，点击刷新获取。</p>}</section>
+    <form className="stack" onSubmit={async e => { e.preventDefault(); if (await act({ action: 'account.update', revision, id: account.id, name: new FormData(e.currentTarget).get('name') })) close(); }}><label>账号显示名称<input name="name" required defaultValue={account.name} maxLength={100} disabled={busy} /></label><div className="bar"><button type="button" disabled={busy} onClick={async () => { if (await act({ action: 'account.remove', id: account.id })) close(); }}>移出账号池</button><button className="primary" type="submit" disabled={busy}>保存名称</button></div><p className="notice">移出账号池后保留凭证文件，可从文件重新导入。</p></form></div>
+    : <CredentialForm key={modal.mode} modal={modal} provider={provider} data={data} busy={busy} act={act} close={close} error={error} notice={notice} />;
+}
+
+function CredentialTransfer({ account, busy, act }) {
+  const container = useRef(null), [pending, setPending] = useState(false), [notice, setNotice] = useState(''), [error, setError] = useState(''), [manual, setManual] = useState('');
+  async function extract(copy) {
+    if (pending || busy) return;
+    setPending(true); setNotice(''); setError(''); setManual('');
+    try {
+      const result = await act({ action: 'account.export', id: account.id }); if (!result) return;
+      if (!copy) { downloadJson(result.exported); setNotice('已发起凭证 JSON 下载，在其他设备添加账号时选择该文件即可。'); return; }
+      const text = JSON.stringify(result.exported.document, null, 2);
+      try { await navigator.clipboard.writeText(text); }
+      catch {
+        // The desktop WebView may not expose Clipboard API; keep copying inside the active dialog.
+        const focus = document.activeElement, area = document.createElement('textarea');
+        area.value = text; area.style.cssText = 'position:fixed;opacity:0;pointer-events:none'; container.current.append(area); area.select();
+        let copied = false;
+        try { copied = document.execCommand('copy'); } catch { /* Offer explicit manual copying below. */ }
+        finally { area.remove(); focus?.focus(); }
+        if (!copied) { setManual(text); setNotice('当前环境不允许自动复制，请点击下方文本框全选并复制。'); return; }
+      }
+      setNotice('凭证 JSON 已复制，可在其他设备添加账号时直接粘贴。');
+    } catch { setError('凭证提取失败，请重试。'); } finally { setPending(false); }
+  }
+  return <section ref={container} className="box stack"><h3>凭证提取与跨设备使用</h3><p className="notice">单账号 JSON 包含登录 Token / PAT，Trae 同时包含必要设备身份。复制及此处导出为明文，请仅在自己的设备间传递；需要加密时使用「配置迁移」。</p><div className="row"><button type="button" disabled={busy || pending} onClick={() => { void extract(true); }}>复制凭证 JSON</button><button type="button" disabled={busy || pending} onClick={() => { void extract(false); }}>导出凭证 JSON</button></div><Feedback error={error} notice={notice} />{manual && <label>手动复制凭证 JSON<textarea readOnly rows="5" autoComplete="off" spellCheck="false" value={manual} onFocus={e => e.currentTarget.select()} /></label>}<p className="notice">新设备：添加账号 → 粘贴 / 选择凭证 JSON → 保存。平台要求重新登录时，需更新凭证。</p></section>;
+}
+
+function CredentialForm({ modal, provider, data, busy, act, close, error, notice }) {
+  const replacing = modal.mode === 'credentials';
+  const [selected, setSelected] = useState(modal.account?.provider || provider), [mode, setMode] = useState('client'), [localError, setLocalError] = useState(''), [json, setJson] = useState('');
+  const [edition, setEdition] = useState(modal.account?.login?.edition || 'auto');
+  const [phone, setPhone] = useState(''), [smsCode, setSmsCode] = useState(''), [sms, setSms] = useState(null), [verify, setVerify] = useState(true), [clock, setClock] = useState(Date.now());
+  useEffect(() => { if (mode !== 'sms') return; const timer = setInterval(() => setClock(Date.now()), 1000); return () => clearInterval(timer); }, [mode]);
+  const resend = Math.max(0, Math.ceil(((sms?.resendAt || 0) - clock) / 1000));
+  const isTrae = selected.startsWith('trae'), isQoder = selected.startsWith('qoder'), global = selected === 'trae-global' || selected === 'workbuddy-ai' || selected === 'qoder-global';
+  const field = (label, name, type = 'text', required = true, value) => <label>{label}<input name={name} type={type} autoComplete="off" required={required} defaultValue={value} disabled={busy} /></label>;
+  function receiveJson(text) {
+    setJson(text); setLocalError('');
+    try { const parsed = JSON.parse(text); if (!replacing && parsed.format === 'dsh-multi-router-account' && data.providers.some(p => p.id === parsed.provider)) {
+      setSelected(parsed.provider); setEdition(parsed.credential?.edition || (parsed.provider === 'trae-global' ? 'sg' : 'cn'));
+    } } catch { /* Allow unfinished JSON while typing. */ }
+  }
+  async function submit(e) {
+    e.preventDefault(); setLocalError(''); const f = Object.fromEntries(new FormData(e.currentTarget));
+    if (mode === 'sms') {
+      const result = await act({ action: 'workbuddy.login', revision: data.revision, challenge: sms?.challenge, code: smsCode, verify, id: replacing ? modal.account.id : undefined, name: f.name || undefined });
+      if (result) { setPhone(''); setSmsCode(''); setSms(null); close(selected); } return;
+    }
+    let document, identityDocument;
+    try {
+      if (mode === 'json') { document = JSON.parse(json); if (f.identityJSON?.trim()) identityDocument = JSON.parse(f.identityJSON); }
+      if (mode === 'manual') {
+        if (isQoder) document = { version: 2, pat: f.pat.trim(), region: global ? 'global' : 'china' };
+        else {
+          const credential = { accessToken: f.accessToken.trim(), ...(f.refreshToken?.trim() ? { refreshToken: f.refreshToken.trim() } : {}), expiresAtMs: new Date(f.expiresAt).getTime(),
+            ...(f.refreshExpiresAt ? { refreshExpiresAtMs: new Date(f.refreshExpiresAt).getTime() } : {}),
+            ...(isTrae ? { userId: f.identityId.trim(), edition, host: global ? 'https://growsg-normal.trae.ai' : 'https://api.trae.cn' } : { uid: f.identityId.trim(), domain: f.domain.trim() }) };
+          document = { version: 1, credential };
+          if (isTrae) identityDocument = { edition, machineId: f.machineId.trim(), deviceId: f.deviceId.trim() };
+        }
+      }
+    } catch { setLocalError('JSON 格式无效，请检查凭证及设备身份 JSON。'); return; }
+    const action = replacing ? 'account.credentials' : 'account.capture';
+    if (await act({ action, revision: modal.revision, id: modal.account?.id, provider: selected, edition, name: f.name || (document?.format === 'dsh-multi-router-account' ? document.name : undefined),
+      ...(document ? { document, identityDocument } : { source: f.source || undefined, identity: f.identity || undefined }) })) { setJson(''); close(selected); }
+  }
+  return <form onSubmit={submit}><div className="modal-body stack"><Feedback error={localError || error} notice={notice} />
+    <div className="grid"><label>供应商 / 区域<select disabled={busy || replacing} value={selected} onChange={e => { setSelected(e.target.value); setEdition('auto'); setMode('client'); setJson(''); setLocalError(''); setSms(null); setSmsCode(''); setPhone(''); }}>{data.providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label>{field('账号名称（可选）', 'name', 'text', false, modal.account?.name)}
+      {isTrae && <label>登录的客户端<select value={edition} disabled={busy} onChange={e => setEdition(e.target.value)}>{(mode === 'client' ? [['auto', '自动识别（推荐）'], ...(global ? [['sg', 'Trae Global'], ['solo-sg', 'TRAE SOLO Global']] : [['cn', 'Trae CN'], ['solo', 'TRAE SOLO CN']])] : global ? [['sg', 'Trae Global'], ['solo-sg', 'TRAE SOLO Global']] : [['cn', 'Trae CN'], ['solo', 'TRAE SOLO CN']]).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label>}</div>
+    <label>凭证添加方式<select disabled={busy} value={mode} onChange={e => { setMode(e.target.value); if (e.target.value !== 'client' && edition === 'auto') setEdition(global ? 'sg' : 'cn'); setJson(''); setLocalError(''); }}><option value="client">一键读取本机登录</option>{selected === 'workbuddy' && <option value="sms">短信登录并保存凭证</option>}<option value="manual">手动填写{isQoder ? ' PAT' : '凭证'}</option><option value="json">粘贴 / 选择凭证 JSON</option></select></label>
+    {mode === 'sms' ? <section className="steps stack"><h3>WorkBuddy 手机号登录</h3><p className="notice">仅用于已有中国版账号。手机号和验证码提交至 WorkBuddy 官方，凭证仅保存在本机，无需安装 Python。</p><label>手机号<input type="tel" inputMode="tel" autoComplete="tel" required pattern="1[3-9][0-9]{9}" maxLength="11" value={phone} disabled={busy || resend > 0} onChange={e => { setPhone(e.target.value); setSms(null); setSmsCode(''); }} /></label><div className="row"><button type="button" disabled={busy || resend > 0 || !/^1[3-9]\d{9}$/.test(phone)} onClick={async () => { const next = await act({ action: 'workbuddy.sms', phone }); if (next) { setSms(next.workbuddyLogin); setClock(Date.now()); setSmsCode(''); } }}>{resend ? `${resend} 秒后可重发` : sms ? '重新发送验证码' : '发送验证码'}</button><span className="notice" role="status">{sms ? clock >= sms.expiresAt ? '验证码已过期，请重新获取' : '验证码已发送，请查看短信' : '点击发送才会请求短信，不自动重试'}</span></div><label>短信验证码<input type="text" inputMode="numeric" autoComplete="one-time-code" required pattern="[0-9]{4,8}" maxLength="8" value={smsCode} disabled={busy || !sms} onChange={e => setSmsCode(e.target.value)} /></label><label className="check"><input type="checkbox" checked={verify} disabled={busy} onChange={e => setVerify(e.target.checked)} />登录后验证刷新令牌（推荐）</label><p className="notice">同一账号更新凭证，新账号独立保存；不会开启自动签到。遇平台验证或限制，请改用本机客户端读取。</p></section> : <section className="steps stack"><h3>获取凭证引导</h3>{isQoder ? <p>在对应国内 / 国际站的账号设置中创建 PAT，然后选择「手动填写 PAT」粘贴。已有旧连接器登录时，可一键读取本机保存的 PAT。网页登录 Cookie 不作为 PAT 使用。</p> : <p>1. 在所选区域的官方客户端登录账号。<br />2. 回到本面板，选择「一键读取本机登录」并点击底部按钮。<br />3. 添加另一个账号时，先在客户端切换登录，再重复读取；已添加的账号会保留独立副本。</p>}
+      <div className="row">{isQoder ? <><a className="link" href="https://docs.qoder.com/cli/authentication" target="_blank" rel="noreferrer">官方 PAT 获取说明</a>{global && <a className="link" href="https://qoder.com/account/integrations" target="_blank" rel="noreferrer">打开 PAT 管理页</a>}</> : <a className="link" href={isTrae ? (global ? 'https://www.trae.ai/' : 'https://www.trae.cn/') : (global ? 'https://www.codebuddy.ai/' : 'https://www.codebuddy.cn/')} target="_blank" rel="noreferrer">打开官方客户端网站</a>}</div>
+      <p className="notice">跨设备已有凭证文件时可选择 JSON；WorkBuddy 需要 accessToken、uid、domain、expiresAtMs；Trae 还需要 userId、edition，以及同账号的 machineId / deviceId。推荐读取客户端或使用加密配置迁移，不需要猜测字段。</p></section>}
+    <div key={`${selected}:${mode}`} className="stack">{mode === 'manual' && (isQoder ? field('Qoder PAT', 'pat', 'password') : <div className="grid">{field('Access Token', 'accessToken', 'password')}{field('Refresh Token（可选）', 'refreshToken', 'password', false)}{field(isTrae ? 'User ID' : 'UID', 'identityId')}{field('Access Token 有效至', 'expiresAt', 'datetime-local')}{field('Refresh Token 有效至（可选）', 'refreshExpiresAt', 'datetime-local', false)}{!isTrae && field('登录 Domain', 'domain', 'text', false, global ? 'www.codebuddy.ai' : 'www.codebuddy.cn')}{isTrae && <>{field('Machine ID', 'machineId')}{field('Device ID', 'deviceId')}</>}</div>)}
+      {mode === 'json' && <><p className="notice">本插件复制 / 导出的单账号 JSON 会自动识别供应商、区域及账号名称；Trae 设备身份随文件导入。</p><label>选择凭证 JSON 文件<input type="file" accept=".json,application/json" disabled={busy} onChange={async e => { const file = e.target.files?.[0]; if (!file) return; if (file.size > 256 * 1024) { setLocalError('凭证文件不能超过 256 KB'); return; } try { receiveJson(await file.text()); } catch { setLocalError('无法读取文件'); } }} /></label><label>凭证 JSON<textarea rows="7" required autoComplete="off" spellCheck="false" disabled={busy} value={json} onChange={e => receiveJson(e.target.value)} placeholder={isQoder ? '{"pat":"…","region":"china"}' : '{"version":1,"credential":{"accessToken":"…", "expiresAtMs":…}}'} /></label>{isTrae && <label>Trae 设备身份 JSON（凭证中已有 identity 时可留空）<textarea name="identityJSON" rows="3" disabled={busy} autoComplete="off" placeholder='{"edition":"cn","machineId":"…","deviceId":"…"}' /></label>}</>}
+      {mode === 'client' && <details><summary>高级：指定登录文件位置</summary><div className="stack" style={{ marginTop: 12 }}>{field('登录 / PAT 文件路径（默认自动查找）', 'source', 'text', false)}{isTrae && field('Trae 设备身份文件路径（可选）', 'identity', 'text', false)}</div></details>}</div>
+    {mode !== 'sms' && <p className="notice">凭证仅保存到本机插件账号池。不会在账号列表显示 Token；每个账号独立刷新。{replacing ? '保存后启用此账号，原凭证副本保留。' : '重复读取同一账号会提示。'}</p>}
+  </div><div className="modal-foot bar"><button type="button" disabled={busy} onClick={close}>取消</button><button className="primary" type="submit" disabled={busy || mode === 'sms' && (!sms || clock >= sms.expiresAt)}>{busy ? '正在处理…' : mode === 'sms' ? '登录并保存到账号池' : mode === 'client' ? '一键获取并保存登录' : '保存凭证并获取模型'}</button></div></form>;
+}
+function MigrationForm({ data, act, busy }) {
+  const [panel, setPanel] = useState(null);
+  const [include, setInclude] = useState(false), [exportPassword, setExportPassword] = useState(''), [confirmPassword, setConfirmPassword] = useState(''), [exportError, setExportError] = useState('');
+  const [document, setDocument] = useState(''), [fileName, setFileName] = useState(''), [password, setPassword] = useState(''), [mode, setMode] = useState('merge'), [preview, setPreview] = useState(null), [error, setError] = useState('');
+  const resetPreview = () => { setPreview(null); setError(''); };
+  return <div className="stack"><div><h3>配置迁移</h3><p className="notice">在设备间迁移账号、模型和路由设置。</p></div><section className="box table-shell"><table className="table"><thead><tr><th scope="col">操作</th><th scope="col">内容</th><th scope="col" className="cell-actions">开始</th></tr></thead><tbody><tr><td><strong>导出到其他设备</strong></td><td>账号与路由设置<small className="muted">可选密码加密携带登录凭证</small></td><td className="cell-actions"><button disabled={busy} onClick={() => setPanel('export')}>导出配置</button></td></tr><tr><td><strong>导入已有配置</strong></td><td>先预览，再确认合并或替换<small className="muted">导入前自动备份本机配置</small></td><td className="cell-actions"><button disabled={busy} onClick={() => setPanel('import')}>导入配置</button></td></tr></tbody></table></section>
+    {panel && <Modal title={panel === 'export' ? '导出配置' : '导入配置'} busy={busy} close={() => setPanel(null)}><div className="modal-body stack">
+    {panel === 'export' && <form className="box stack" onSubmit={async e => { e.preventDefault(); setExportError(''); if (include && exportPassword !== confirmPassword) { setExportError('两次迁移密码不一致'); return; }
+    const result = await act({ action: 'config.export', includeCredentials: include, password: include ? exportPassword : undefined }); if (!result) return;
+    downloadJson(result.exported); setExportPassword(''); setConfirmPassword('');
+  }}><h3>导出到其他设备</h3><p className="notice">包含账号名称和顺序、模型展示设置、路由与切换规则。不会导出会话、统计、文件路径或管理密钥。</p><label className="check"><input type="checkbox" checked={include} disabled={busy} onChange={e => { setInclude(e.target.checked); setExportPassword(''); setConfirmPassword(''); }} />同时迁移账号登录凭证（密码加密）</label>
+    {include ? <><p className="steps">加密文件包含登录 Token / PAT 和必要设备身份，请自行保管。新设备需要同一密码；凭证可能因平台设备限制而需要重新登录。</p><label>设置迁移密码<input type="password" autoComplete="new-password" required minLength="10" maxLength="1024" value={exportPassword} disabled={busy} onChange={e => setExportPassword(e.target.value)} /></label><label>再次输入密码<input type="password" autoComplete="new-password" required value={confirmPassword} disabled={busy} onChange={e => setConfirmPassword(e.target.value)} /></label></> : <p className="steps">仅配置文件不含登录凭证。新设备上的账号会先停用，补充凭证后即可启用；合并导入会保留本机已有账号凭证。</p>}
+    <Feedback error={exportError} /><button className="primary" type="submit" disabled={busy}>{include ? '导出加密迁移文件' : '导出配置 JSON'}</button></form>}
+    {panel === 'import' && <form className="box stack" onSubmit={async e => { e.preventDefault(); setError(''); const result = await act({ action: 'config.preview', document, password, mode }); if (result) setPreview({ ...result.importPreview, revision: result.revision }); }}><h3>导入插件配置</h3><label>选择迁移 JSON 文件<input type="file" accept=".json,application/json" required disabled={busy} onChange={async e => { resetPreview(); setPassword(''); setDocument(''); const file = e.target.files?.[0]; if (!file) return; if (file.size > 900 * 1024) { setError('迁移文件不能超过 900 KB'); return; } try { setDocument(await file.text()); setFileName(file.name); } catch { setError('无法读取文件'); } }} /></label>{fileName && <p className="mono muted">{fileName}</p>}
+      <label>迁移密码（仅加密文件需要）<input type="password" autoComplete="off" maxLength="1024" disabled={busy} value={password} onChange={e => { setPassword(e.target.value); resetPreview(); }} /></label><label>导入方式<select disabled={busy} value={mode} onChange={e => { setMode(e.target.value); resetPreview(); }}><option value="merge">合并：保留本机额外账号和路由</option><option value="replace">替换：使用导入文件的完整配置</option></select></label>
+      <p className="notice">合并时同 ID 的配置会更新；带凭证的账号会更新登录副本。替换会移出现有配置中的额外账号 / 路由，但保留原凭证文件。两种方式都会先备份本机配置。</p><Feedback error={error} /><button type="submit" disabled={busy || !document}>检查文件并预览变更</button>
+      {preview && <section className="steps stack"><h3>导入预览</h3><p>{preview.accounts} 个账号（新增 {preview.newAccounts}） · {preview.credentials} 份凭证<br />{preview.routes} 条路由 · 更新同名路由 {preview.overwrittenRoutes} 条<br />{preview.needsLogin} 个新账号需补充登录，将先停用</p><button className="primary" type="button" disabled={busy} onClick={async () => { if (await act({ action: 'config.import', revision: preview.revision, document, password, mode })) { setDocument(''); setPassword(''); setPreview(null); } }}>确认{mode === 'merge' ? '合并' : '替换'}并导入</button></section>}
+    </form>}
+    </div></Modal>}
+  </div>;
+}
+function ExpiryStatus({ route, act, busy, revision, onForce }) {
+  const status = route.expiringStatus || {}, cooling = status.cooldownUntil > Date.now();
+  return <div className="steps stack"><p>{cooling ? `临期优先冷却中 · 剩余约 ${Math.ceil((status.cooldownUntil - Date.now()) / 3600000)} 小时，${when(status.cooldownUntil)} 后恢复` : `临期优先已就绪 · 第 ${status.number || 1} 轮${status.accounts?.length ? ` · 已完成 ${status.completed?.length || 0} / ${status.accounts.length} 个账号` : ''}`}</p><p className="notice">所有临期账号的积分耗尽或达到每轮额度后，临期优先暂停 3 天；期间按普通路由规则运行，重启后冷却仍保留。</p>{cooling && <button type="button" disabled={busy} onClick={async () => { const result = await act({ action: 'route.force-expiring', id: route.id, revision }); if (result) onForce?.(result); }}>强制开启并开始新一轮</button>}{cooling && <p className="notice">强制开启会清除临期冷却，并重置本路由的本轮额度计数；累计用量保留。</p>}</div>;
+}
+function FreeStatus({ route, busy, act, onUpdate }) {
+  const status = route.freeStatus, accounts = status?.accounts || [], count = accounts.reduce((n, a) => n + a.models.length, 0);
+  const models = status?.modelRoutes || [];
+  const update = async (model, patch) => { const next = await act({ action: 'free.model.update', parentId: route.id, id: model.id, ...patch }); if (next) onUpdate?.(next); };
+  return <section className="steps stack"><div className="bar"><h3>免费模型 · {models.length} 种 · {count} 个账号 / 模型组合</h3><button type="button" disabled={busy || status?.checking} onClick={() => { void act({ action: 'free.refresh' }); }}>{status?.checking ? '正在检查…' : '立即检查免费模型'}</button></div><p className="notice">按模型自动创建路由，勾选后分别出现在 DSH 模型列表中。同一模型只在有免费资格且支持所选推理等级的账号间切换，不混用其他模型。每天检查，调用前复核；恢复收费或检查失败时自动移出，免费恢复后保留你的勾选和档位设置。</p>
+    <div className="box table-shell"><div className="scroll" role="region" aria-label="免费模型展示与推理等级" tabIndex="0"><table className="table"><thead><tr><th scope="col">模型 / 展示</th><th scope="col">可用账号</th><th scope="col">上下文 / 推理等级</th></tr></thead><tbody>{models.map(m => <tr key={m.id} className={m.selected ? 'selected' : ''}><td><label className="check"><input type="checkbox" aria-label={`展示 ${m.modelName}`} disabled={busy} checked={m.selected} onChange={e => { void update(m, { visible: e.target.checked }); }} /><strong>{m.modelName}</strong></label><small className="muted">{m.name.split(' · ').at(-1)} · {fmt(m.contextWindow / 1000)}K 上下文</small></td><td>{m.accountNames.join('、') || '暂无账号'}</td><td><ContextSelect model={m} value={m.configuredContextWindow} disabled={busy} label={`${m.modelName} 上下文`} onChange={contextWindow => { void update(m, { contextWindow }); }} /><label><span className="sr-only">{m.modelName} 推理等级</span><select aria-label={`${m.modelName} 推理等级`} disabled={busy} value={m.reasoningEffort || ''} onChange={e => { void update(m, { reasoningEffort: e.target.value || null }); }}><option value="">平台默认</option>{m.reasoning?.supportedEfforts?.map(e => <option key={e} value={e}>{effortNames[e] || e}</option>)}</select></label>{m.effortUnavailable && <small className="warn">原档位暂不可用，使用平台默认</small>}</td></tr>)}</tbody></table></div></div>
+    {!models.length && <p className="notice">暂无确认免费的模型。添加并启用账号，或立即检查目录。</p>}
+    <details><summary>各账号检查状态</summary><div className="stack" style={{ marginTop: 12 }}>{accounts.map(a => <div key={a.id}><p>{a.name} · {a.models.length ? a.models.map(m => m.name).join('、') : a.error ? '检查失败，暂不参与' : '暂无确认免费的模型'}</p><p className="notice">{a.provider} · 上次目录检查 {when(a.checkedAt)}</p></div>)}</div></details>
+  </section>;
+}
+function FreeRouteForm({ draft, setDraft, data, act, busy, error, notice }) {
+  return <form onSubmit={async e => { e.preventDefault(); const { id, previousId, revision, reasoning, supportsImages, expiringStatus, freeStatus, maxContextWindow, supportedContextWindows, configuredContextWindow, contextKnown, eligibleAccountIds, enforceContext, ...route } = draft;
+    route.targets = route.targets.map(t => ({ provider: t.provider, ...(t.account ? { account: t.account } : {}), ...(t.model ? { model: t.model } : {}), ...(t.models ? { models: t.models } : {}) }));
+    if (await act({ action: 'route.save', id, previousId, revision, route })) setDraft(null);
+  }}><div className="modal-body stack"><Feedback error={error} notice={notice} /><label>管理组名称<input required maxLength={200} disabled={busy} value={draft.name} onChange={e => setDraft(d => ({ ...d, name: e.target.value }))} /></label><p className="notice">Free 的模型路由由目录自动维护，无需填写模型 ID。账号启停在「账号与登录」调整。</p><FreeStatus route={data.routes.find(r => r.id === draft.id) || draft} act={act} busy={busy} onUpdate={next => setDraft(d => ({ ...d, revision: next.revision, freeModels: next.routes.find(r => r.id === d.id)?.freeModels }))} /><label className="check"><input type="checkbox" checked={draft.visible !== false} disabled={busy} onChange={e => setDraft(d => ({ ...d, visible: e.target.checked }))} />展示勾选的免费模型</label></div><div className="modal-foot bar"><button type="button" disabled={busy} onClick={async () => { if (await act({ action: 'route.remove', id: draft.id, revision: draft.revision })) setDraft(null); }}>移除免费管理组</button><button className="primary" disabled={busy} type="submit">保存设置</button></div></form>;
+}
+export function RouteReasoningSelect({ draft, setDraft, data, busy }) {
+  const targets = draft.targets.map(t => ({ provider: t.provider, ...(t.account ? { account: t.account } : {}),
+    models: t.modelText.split(',').map(x => x.trim()).filter(Boolean) }));
+  const signature = JSON.stringify({ action: 'route.preview', revision: data.revision,
+    catalogs: data.accounts?.map(a => [a.id, a.enabled, a.fetchedAt]), id: draft.id || 'preview', route: {
+    contextMode: draft.contextMode ?? 'maximum', contextWindow: draft.contextWindow, maxTokens: 1,
+    targets: targets.map(({ models, ...target }) => ({ ...target, ...(models.length ? { models } : {}) })) } });
+  const [preview, setPreview] = useState(null);
+  useEffect(() => {
+    const abort = new AbortController();
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetch(ENDPOINT, { method: 'POST', signal: abort.signal,
+          headers: { 'Content-Type': 'application/json', 'X-Multi-Router-Key': data.key }, body: signature });
+        const next = await readManagementResponse(res);
+        if (!abort.signal.aborted) setPreview({ signature, ...next.routePreview });
+      } catch (e) { if (!abort.signal.aborted) setPreview({ signature, error: e.message }); }
+    }, 250);
+    return () => { clearTimeout(timer); abort.abort(); };
+  }, [signature, data.key]);
+  const pending = preview?.signature !== signature, modes = pending ? [] : preview?.reasoning?.supportedEfforts ?? [];
+  const effort = draft.reasoningEffort ?? '', unavailable = !!effort && !pending && !preview?.error && !modes.includes(effort);
+  return <div className="stack"><label>默认思考深度<select aria-describedby="route-reasoning-help" disabled={busy || pending || !!preview?.error} value={effort} onChange={e => setDraft(d => ({ ...d, reasoningEffort: e.target.value || null }))}>
+    <option value="">平台默认</option>{effort && !modes.includes(effort) && <option value={effort} disabled>{effortNames[effort] || effort}（{pending ? '核对中' : '当前不可用'}）</option>}{modes.map(e => <option key={e} value={e}>{effortNames[e] || e}</option>)}
+  </select></label><p id="route-reasoning-help" className={preview?.error || unavailable ? 'warn notice' : 'notice'} role="status">{pending ? '正在核对目标模型支持的档位…' : preview?.error || (unavailable ? '原档位当前不可用，请选择其他档位或平台默认。' : !preview?.contextKnown ? '尚未获取目标模型目录，暂时只能使用平台默认。' : !modes.length ? '目标模型未声明可调档位，使用平台默认。' : '仅展示当前目标与上下文容量支持的档位。')}</p><p className="notice">会话里手动选择的档位优先。指定深度后，仅在支持该档位的账号间切换；关闭思考仅在渠道支持时提供。</p></div>;
+}
+function RouteForm({ draft, setDraft, data, act, busy, error, notice }) {
+  if (draft.freeOnly) return <FreeRouteForm draft={draft} setDraft={setDraft} data={data} act={act} busy={busy} error={error} notice={notice} />;
+  const set = (key, value) => setDraft(d => ({ ...d, [key]: value }));
+  const target = (i, patch) => setDraft(d => ({ ...d, targets: d.targets.map((t, index) => i === index ? { ...t, ...patch } : t) }));
+  const move = (i, delta) => { const targets = [...draft.targets]; [targets[i], targets[i + delta]] = [targets[i + delta], targets[i]]; set('targets', targets); };
+  const strategyHelp = { failover: '优先使用前面的账号；遇到 4xx 后换下一个，成功账号继续承接请求。', weighted: '按每个账号的权重分配请求。例如 3:1，长期约 75%:25%；短期比例与请求长度可能不同。', tokens: '每个账号累计达到本轮 Token 额度后，下一次请求换账号。所有目标用完额度后开始新一轮。', credits: '按平台余额下降计算本轮消耗，达到阈值后换账号。余额可能包含其他应用的消费；积分查询失败时暂不使用该账号。' };
+  return <form onSubmit={async e => { e.preventDefault(); if (draft.id !== 'ds4.1f' && draft.targets.some(t => !t.modelText.trim())) { e.currentTarget.querySelector('details')?.setAttribute('open', ''); return; } const { id, previousId, revision, reasoning, supportsImages, expiringStatus, maxContextWindow, supportedContextWindows, configuredContextWindow, contextKnown, eligibleAccountIds, enforceContext, ...route } = draft;
+    route.targets = route.targets.map(t => { const models = t.modelText.split(',').map(x => x.trim()).filter(Boolean); return { provider: t.provider, ...(t.account ? { account: t.account } : {}), ...(models.length ? { models } : {}), ...(route.strategy === 'weighted' ? { weight: Number(t.weight) } : {}), ...(route.strategy === 'tokens' ? { tokenBudget: Number(t.tokenBudget) } : {}), ...(route.strategy === 'credits' ? { creditBudget: Number(t.creditBudget) } : {}) }; });
+    if (await act({ action: 'route.save', id, previousId, revision, route })) setDraft(null);
+  }}><div className="modal-body stack"><Feedback error={error} notice={notice} /><label>路由名称<input required maxLength={200} value={draft.name} disabled={busy} onChange={e => set('name', e.target.value)} placeholder="例如 我的 Flash 自动切换" /></label><p className="notice">名称显示在 DSH 模型列表中，可随时修改，不影响已有会话的路由选择。</p>
+      <section className="box stack" aria-labelledby="route-model-parameters"><h3 id="route-model-parameters">模型参数</h3><div className="grid">
+        <div className="stack"><label>上下文容量<select disabled={busy} value={draft.contextMode ?? 'maximum'} onChange={e => set('contextMode', e.target.value)}><option value="maximum">使用模型最大容量（默认）</option><option value="custom">手动设置本地预算</option></select></label>{draft.contextMode === 'custom' && <label>上下文预算（Token）<input type="number" disabled={busy} min="1" required value={draft.contextWindow} onChange={e => set('contextWindow', Number(e.target.value))} /></label>}<p className="notice">默认随模型目录更新。只向支持当前容量的渠道切换；调低预算可让更多渠道参与。不会删除会话历史。</p></div>
+        <RouteReasoningSelect draft={draft} setDraft={setDraft} data={data} busy={busy} />
+      </div></section>
+      <label>账号切换规则<select disabled={busy} value={draft.strategy} onChange={e => set('strategy', e.target.value)}>{Object.entries(strategies).map(([id, label]) => <option key={id} value={id}>{label}</option>)}</select></label><p className="steps">{strategyHelp[draft.strategy]}{['tokens', 'credits'].includes(draft.strategy) && ' 正在输出的回答会完成，额度允许超过最后一次请求的用量。'}</p>
+      <div className="box stack"><label className="check"><input type="checkbox" disabled={busy} checked={draft.preferExpiringCredits !== false} onChange={e => set('preferExpiringCredits', e.target.checked)} />优先使用临期积分（默认开启）</label><p className="notice">优先使用仍有余额且更早到期的积分包；优先级高于顺序和权重，仍遵守每轮额度与故障切换。平台未提供有效期或用量数据过期时，按普通规则执行。</p>{draft.preferExpiringCredits !== false && <label>临期范围（天）<input type="number" disabled={busy} min="1" max="365" required value={draft.expiringWithinDays ?? 7} onChange={e => set('expiringWithinDays', Number(e.target.value))} /></label>}</div>
+      {draft.preferExpiringCredits !== false && <ExpiryStatus route={data.routes.find(r => r.id === draft.previousId) || draft} busy={busy} act={act} revision={draft.revision} onForce={result => setDraft(d => ({ ...d, revision: result.revision, expiringStatus: result.routes.find(r => r.id === draft.previousId)?.expiringStatus }))} />}
+      <div className="bar"><h3>模型与账号目标</h3><span className="notice">按下方顺序切换</span></div>
+      {draft.targets.map((t, i) => { const models = data.providers.find(p => p.id === t.provider)?.models || []; return <section className="box stack" key={t.key}><div className="bar target-head"><strong>目标 {i + 1}</strong><div className="row"><button type="button" disabled={busy || i === 0} onClick={() => move(i, -1)}>前移</button><button type="button" disabled={busy || i === draft.targets.length - 1} onClick={() => move(i, 1)}>后移</button><button type="button" disabled={busy || draft.targets.length === 1} onClick={() => set('targets', draft.targets.filter((_, index) => index !== i))}>移除</button></div></div>
+        <div className="grid"><label>供应商<select disabled={busy} value={t.provider} onChange={e => target(i, { provider: e.target.value, account: '', modelText: '' })}>{data.providers.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}</select></label><label>使用账号<select disabled={busy} value={t.account || ''} onChange={e => target(i, { account: e.target.value })}><option value="">此供应商全部启用账号</option>{data.accounts.filter(a => a.provider === t.provider).map(a => <option key={a.id} value={a.id}>{a.name}</option>)}</select></label>
+          <label className="full">目标模型<select disabled={busy} required={draft.id !== 'ds4.1f'} value={t.modelText} onChange={e => { if (e.target.value) target(i, { modelText: e.target.value }); }}><option value="">从已发现模型中选择</option>{t.modelText && !models.some(m => m.id === t.modelText) && <option value={t.modelText}>{t.modelText}</option>}{models.map(m => <option key={m.id} value={m.id}>{m.name} · {m.id}</option>)}</select></label>
+          {draft.strategy === 'weighted' && <label>每个账号的权重<input type="number" disabled={busy} min="1" max="1000" required value={t.weight} onChange={e => target(i, { weight: e.target.value })} /></label>}
+          {draft.strategy === 'tokens' && <label>每个账号每轮 Token 额度<input type="number" disabled={busy} min="1" step="1" required value={t.tokenBudget} onChange={e => target(i, { tokenBudget: e.target.value })} /></label>}
+          {draft.strategy === 'credits' && <label>每个账号每轮积分消耗<input type="number" disabled={busy} min="0.01" step="any" required value={t.creditBudget} onChange={e => target(i, { creditBudget: e.target.value })} /></label>}
+        </div><details><summary>高级：手动填写候选模型 ID</summary><label style={{ marginTop: 10 }}>候选模型 ID（逗号分隔）<input disabled={busy} value={t.modelText} onChange={e => target(i, { modelText: e.target.value })} placeholder="按顺序匹配真实模型目录" /></label></details>
+      </section>; })}
+      <button type="button" disabled={busy} onClick={() => set('targets', [...draft.targets, { provider: 'workbuddy', account: '', key: crypto.randomUUID(), weight: 1, tokenBudget: 100000, creditBudget: 100, modelText: '' }])}>添加切换目标</button>
+      <details><summary>高级：输出长度</summary><div className="grid" style={{ marginTop: 12 }}><label>最大输出长度<input type="number" disabled={busy} min="1" max={draft.contextWindow} required value={draft.maxTokens} onChange={e => set('maxTokens', Number(e.target.value))} /></label></div></details>
+    </div><div className="modal-foot bar">{draft.previousId ? <button type="button" disabled={busy} onClick={async () => { if (await act({ action: 'route.remove', revision: draft.revision, id: draft.previousId })) setDraft(null); }}>移除路由</button> : <button disabled={busy} type="button" onClick={() => setDraft(null)}>取消</button>}<button className="primary" type="submit" disabled={busy}>{busy ? '正在保存…' : '保存路由'}</button></div>
+  </form>;
+}
+
+export function InitialSetup({ data, busy, act, go }) {
+  const discovery = data.localDiscovery ?? [];
+  const discovering = data.startup?.phase === 'discovering';
+  const saved = discovery.reduce((n, s) => n + (s.savedCount ?? 0), 0);
+  return <section className="box stack" aria-label="首次账号设置"><div className="bar"><div><h3>本机账号自动获取{discovering ? '进行中' : discovery.length ? '已完成' : '待重试'}</h3><p className="notice">{discovering ? '正在后台读取 WorkBuddy / Trae 本机登录，无需手动重复获取，已有账号可以继续使用。' : saved ? `已保存 ${saved} 个 WorkBuddy / Trae 本机登录，无需再次手动添加。` : '暂未保存本机登录。先在官方客户端登录，再点击「一键获取并保存」。'}</p></div><button disabled={busy} onClick={() => { void act({ action: 'setup.dismiss' }); }}>知道了</button></div>
+    <div className="providers">{discovery.map(s => <div className="steps" key={s.provider}><strong>{data.providers.find(p => p.id === s.provider)?.name ?? s.provider}</strong><p className={(s.savedCount ?? 0) > 0 ? 'good' : 'notice'}>{s.savedCount ? `已保存 ${s.savedCount} 个登录` : s.state === 'found' ? '检测到登录；已忽略或尚未保存，请重新获取' : s.state === 'unreadable' ? '登录文件无法读取，请在客户端重新登录后重试' : '未检测到登录，请先登录官方客户端'}</p></div>)}</div>
+    <div className="row"><button className="primary" disabled={busy || discovering} onClick={() => { void act({ action: 'accounts.discover' }); }}>一键获取并保存 WorkBuddy / Trae</button><button disabled={busy} onClick={() => go('accounts')}>查看账号 / 手动添加</button><button disabled={busy} onClick={() => go('routes')}>选择路由模型</button></div><p className="notice">首次启动自动执行一次，之后每分钟检测新增登录。Qoder 使用 PAT，请到「账号与登录」添加；未安装客户端也可以手动填写凭证。</p>
+  </section>;
+}
+const updateNames = { unchecked: '待检查', available: '可更新', current: '已同步', pinned: '固定提交', unsupported: '本地来源', failed: '检查 / 安装失败', installed: '已安装' };
+export function PluginUpdatesPanel({ data, busy, act }) {
+  const [query, setQuery] = useState(''), [selected, setSelected] = useState([]), [plan, setPlan] = useState(null), [registry, setRegistry] = useState(''), [filter, setFilter] = useState('all'), [pluginSearch, setPluginSearch] = useState('');
+  const [diagnostic, setDiagnostic] = useState(null), [copied, setCopied] = useState(false);
+  const running = data?.job?.state === 'running', blocked = busy || running;
+  const rows = (data?.rows ?? []).filter(r => r.source.kind !== 'builtin'), available = rows.filter(r => r.status === 'available' || r.status === 'failed' && r.target);
+  useEffect(() => { if (data?.available && !running) void act({ action: !data.checkedAt || Date.now() - data.checkedAt > 86400000 ? 'plugins.check' : 'plugins.list' }); }, []);
+  const chosen = available.filter(r => selected.includes(r.name));
+  const visibleRows = rows.filter(r => r.name.toLowerCase().includes(pluginSearch.toLowerCase()) && (filter === 'all' || (filter === 'updates' ? available.includes(r) : r.source.kind === filter)));
+  async function submitPlan() {
+    if (await act(plan.kind === 'install' ? { action: 'plugins.install', spec: plan.spec, registry: registry || undefined } : { action: 'plugins.update', names: plan.rows.map(r => r.name), registry: registry || undefined })) { setPlan(null); setSelected([]); }
+  }
+  if (!data?.available) return <section className="box stack"><h3>当前 DSH 未提供插件管理接口</h3><p>请升级 DeepSeek Harness 后重试。本页管理当前 DSH 配置中由用户安装的插件。</p></section>;
+  return <div className="stack"><section className="box stack"><div className="bar"><div><h3>用户安装的插件与更新</h3><p className="notice">{rows.length} 个用户安装插件 · {available.length} 个可更新</p></div><button className="primary" disabled={blocked} onClick={() => { void act({ action: 'plugins.check' }); }}>检查全部更新</button></div>
+    <p className="notice">上次检查 {when(data.checkedAt)} · 每天自动检查并提醒</p>
+    <details className="help"><summary>安装源与检查规则</summary><div className="stack"><label className="filter">npm 安装源<select value={registry} disabled={blocked} onChange={e => setRegistry(e.target.value)}><option value="">DSH 设置（含回退来源）</option><option value="https://registry.npmjs.org/">npm 官方</option><option value="https://registry.npmmirror.com/">npmmirror</option></select></label><p className="notice">npm 按版本 / 发布频道检查，GitHub 按分支提交检查；保留启用状态，固定 Git 提交保持不动。</p></div></details>
+  </section>
+    {data.job && !(data.job.kind === 'check' && data.job.state === 'done') && <section className="box stack" aria-live="polite"><div className="bar"><h3>{running ? data.job.kind === 'check' ? '正在检查更新…' : '正在安装插件…' : data.job.state === 'cancelled' ? '操作已取消' : data.job.state === 'failed' || data.job.results.some(r => r.status === 'failed') ? '有插件未完成安装' : '操作已完成'}</h3>{running && <button disabled={busy} onClick={() => { void act({ action: 'plugins.cancel' }); }}>取消</button>}</div><progress max={Math.max(1, data.job.total)} value={data.job.results.length} aria-label="插件操作进度" /><p className="notice">{data.job.results.length} / {data.job.total}{data.job.current ? ` · ${data.job.current}` : ''}</p>
+      {data.job.message && <p className="error">{data.job.message}</p>}{data.job.results.map((r, i) => <div key={r.name + i} className="item"><strong>{r.name}</strong><p className={r.status === 'failed' ? 'error' : 'notice'}>{r.message || updateNames[r.status] || r.status}</p>{r.diagnostic && <button type="button" onClick={() => { setCopied(false); setDiagnostic(JSON.stringify({ plugin: r.name, targetVersion: r.expectedVersion, ...r.diagnostic }, null, 2)); }}>查看脱敏诊断</button>}{r.pendingBuilds?.length > 0 && <p className="notice">待授权脚本：{r.pendingBuilds.join('、')}。请在 DSH 原插件安装页授权后重试。</p>}</div>)}
+      {data.job.results.some(r => r.restartRequired) && <p className="steps">更新文件已安装。macOS 使用 ⌘Q 完全退出 DSH 后重开；Windows 退出托盘应用后重开；网页版重启服务。关闭窗口和「刷新面板」不会重载后台。</p>}
+    </section>}
+    <section className="box table-shell"><div className="bar section-pad"><div className="row"><button disabled={blocked || !available.length} onClick={() => setSelected(available.map(r => r.name))}>选择全部可更新</button><button disabled={blocked || !selected.length} onClick={() => setSelected([])}>清空选择</button></div><button className="primary" disabled={blocked || !chosen.length} onClick={() => setPlan({ kind: 'update', rows: chosen })}>更新所选（{chosen.length}）</button></div>
+      <div className="row section-pad"><label style={{ flex: 1 }}>搜索已安装插件<input value={pluginSearch} onChange={e => setPluginSearch(e.target.value)} placeholder="按插件名称筛选" /></label><label className="filter">显示范围<select value={filter} onChange={e => setFilter(e.target.value)}><option value="all">全部用户安装插件</option><option value="updates">可更新 / 重试</option><option value="npm">npm 来源</option><option value="github">GitHub 来源</option></select></label></div>
+      <div className="scroll" role="region" aria-label="用户安装插件列表" tabIndex="0"><table className="table"><thead><tr><th scope="col">插件 / 选择</th><th scope="col">来源与版本</th><th scope="col">状态</th><th scope="col" className="cell-actions">操作</th></tr></thead><tbody>{visibleRows.map(r => <tr key={r.name} className={selected.includes(r.name) ? 'selected' : ''}><td><label className="check"><input aria-label={`选择更新 ${r.name}`} type="checkbox" disabled={blocked || !available.includes(r)} checked={selected.includes(r.name)} onChange={e => setSelected(e.target.checked ? [...selected, r.name] : selected.filter(n => n !== r.name))} /><strong className="mono">{r.name}</strong></label><small className="muted">{r.enabled ? '启用' : '停用'}</small></td><td>{r.source.kind === 'npm' ? `npm · ${r.version || '未知'}${r.latestVersion ? ' → ' + r.latestVersion : ''}` : r.source.kind === 'github' ? `GitHub · ${r.version || '未知版本'}` : '本地文件 / 开发链接'}<small className="muted mono">{r.source.kind === 'npm' ? `安装声明 ${r.source.source} · 检查 ${r.source.tag}` : r.source.kind === 'github' ? `${r.commit?.slice(0, 8) || '未知提交'}${r.latestCommit ? ' → ' + r.latestCommit.slice(0, 8) : ''}` : ''}</small></td><td><span className={r.status === 'failed' ? 'error' : r.status === 'available' ? 'good' : 'muted'}>{updateNames[r.status]}</span>{r.message && <small className={r.status === 'failed' ? 'error' : 'muted'}>{r.message}</small>}</td><td className="cell-actions">{available.includes(r) ? <button disabled={blocked} onClick={() => setPlan({ kind: 'update', rows: [r] })}>查看并更新</button> : '—'}</td></tr>)}</tbody></table>{!visibleRows.length && <p className="empty">{running ? '正在读取插件清单…' : rows.length ? '没有匹配的已安装插件，请调整筛选。' : '当前配置尚未读取插件，请检查更新。'}</p>}</div>
+    </section>
+    <details className="box help install-plugin"><summary>安装 npm / GitHub 插件</summary><div className="stack"><form className="row" onSubmit={e => { e.preventDefault(); const spec = new FormData(e.currentTarget).get('spec').trim(); if (spec) setPlan({ kind: 'install', spec }); }}><label style={{ flex: 1 }}>安装地址<input name="spec" value={query} onChange={e => setQuery(e.target.value)} disabled={blocked} required placeholder="包名、包名@版本 或 github:用户/仓库" autoComplete="off" /></label><button disabled={blocked || !query.trim()}>查看并安装</button></form><p className="notice">使用 DSH 自带安装器执行兼容检查、镜像重试和失败回滚。npm 镜像只作用于 npm 包，GitHub 下载失败需检查 GitHub 网络。网络失败后可重新检查或更换 npm 安装源再重试。</p></div></details>
+    {diagnostic && <Modal title="插件安装诊断" close={() => setDiagnostic(null)}><div className="modal-body stack"><p className="notice">以下信息只含插件名、版本、系统和错误分类，可复制用于排查；未包含原始日志、用户名路径或凭证。若原因未知，请在 DSH 原生插件页获取安装日志。</p><textarea aria-label="脱敏安装诊断" readOnly rows="9" value={diagnostic} onFocus={e => e.currentTarget.select()} /><button onClick={async () => { try { await navigator.clipboard.writeText(diagnostic); setCopied(true); } catch { setCopied(false); } }}>{copied ? '已复制' : '复制诊断'}</button></div></Modal>}
+    {plan && <Modal title={plan.kind === 'install' ? '确认安装插件' : '确认更新插件'} close={() => setPlan(null)} busy={blocked}><div className="modal-body stack"><p>这些操作作用于当前 DSH 配置的所有会话。安装后是否需要重启，会在结果中说明。</p>{plan.kind === 'install' ? <p className="mono">{plan.spec}</p> : plan.rows.map(r => <div className="steps" key={r.name}><strong>{r.name}</strong><p className="mono">{r.target}</p><p>{r.source.kind === 'npm' ? `${r.version || '未知'} → ${r.latestVersion}` : `${r.commit?.slice(0, 8) || '未知提交'} → ${r.latestCommit?.slice(0, 8) || '未知提交'}`}</p><p className="notice">保留为{r.enabled ? '启用' : '停用'}；{r.source.kind === 'github' ? '继续跟随原分支 / 标签' : '更新到所示 npm 版本'}。</p></div>)}<p className="notice">npm 安装源：{registry || '沿用 DSH 设置'}</p></div><div className="modal-foot row"><button className="primary" disabled={blocked} onClick={() => { void submitPlan(); }}>确认{plan.kind === 'install' ? '安装' : '更新'}</button><button disabled={blocked} onClick={() => setPlan(null)}>取消</button></div></Modal>}
+  </div>;
+}

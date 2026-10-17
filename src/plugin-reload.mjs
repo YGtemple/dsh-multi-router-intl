@@ -1,0 +1,84 @@
+import { readFile } from 'node:fs/promises';
+import { watch } from 'node:fs';
+import { join } from 'node:path';
+import { parse } from 'yaml';
+
+// Let DSH reconcile its profile; never alter the host's module caches. Release
+// specific host specifiers turn both its server and browser module generations.
+// A plugin activated by HMR inherits its AsyncLocalStorage marker in timers
+// and file watchers, even after activation finishes. Exit only that inherited
+// marker before entering the official queue; serialization stays with DSH.
+export function outsideActivation(hmr, operation) {
+  const scope = hmr?.executing;
+  return typeof scope?.exit === 'function' ? scope.exit(operation) : operation();
+}
+
+export class PluginReload {
+  constructor({ service, profile, canReload, hmr = () => undefined, busy = () => false, now = Date.now, runningVersion }) {
+    Object.assign(this, { service, profile, canReload, hmr, busy, now, runningVersion });
+    this.phase = 'current'; this.installedVersion = runningVersion; this.retryAt = 0;
+  }
+  state() { return { runningVersion: this.runningVersion, installedVersion: this.installedVersion, phase: this.phase, canReload: !!this.canReload(), message: this.message }; }
+  start() {
+    const dir = this.profile()?.dir;
+    this.watchers = [];
+    if (dir) for (const target of [dir, join(dir, 'node_modules')]) try {
+      const watcher = watch(target, () => this.schedule()); watcher.unref(); this.watchers.push(watcher);
+    } catch { /* Minute tick also detects unavailable directory watches. */ }
+    this.schedule();
+  }
+  schedule(delay = 500) {
+    if (this.closed) return;
+    clearTimeout(this.timer);
+    this.timer = setTimeout(() => { void this.check().catch(() => {}); }, delay); this.timer.unref();
+  }
+  stop() { this.closed = true; clearTimeout(this.timer); for (const watcher of this.watchers ?? []) watcher.close(); }
+  check() {
+    if (this.closed) return Promise.resolve();
+    if (this.flight) return this.flight;
+    this.flight = this.inspect().finally(() => { this.flight = undefined; });
+    return this.flight;
+  }
+  async inspect() {
+    const dir = this.profile()?.dir;
+    if (!dir) return;
+    let manifest, installed;
+    try {
+      manifest = JSON.parse(await readFile(join(dir, 'package.json'), 'utf8'));
+      installed = JSON.parse(await readFile(join(dir, 'node_modules/dsh-multi-router/package.json'), 'utf8'));
+    } catch { return; } // A package replacement can briefly remove its link.
+    if (this.closed || !manifest.dsh?.profile?.bundles?.includes('dsh-multi-router')) return;
+    if (installed.name !== 'dsh-multi-router' || !/^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(installed.version)) return;
+    this.installedVersion = installed.version;
+    if (installed.version === this.runningVersion) { this.phase = 'current'; this.message = undefined; return; }
+    const declared = manifest.dependencies?.['dsh-multi-router'];
+    const exact = typeof declared === 'string' && /^(?:npm:dsh-multi-router@)?(\d+\.\d+\.\d+(?:-[\w.-]+)?)$/.exec(declared)?.[1];
+    let installing = false;
+    const pid = Number(await readFile(join(dir, 'package.json.lock'), 'utf8').catch(() => ''));
+    if (Number.isInteger(pid) && pid > 0) try { process.kill(pid, 0); installing = true; } catch (e) { installing = e.code !== 'ESRCH'; }
+    if (installing || exact && exact !== installed.version) {
+      this.phase = 'waiting'; this.message = '安装事务尚未完成，或安装失败已回滚；等待配置与文件版本一致后再加载。';
+      if (installing) this.schedule(1000);
+      return;
+    }
+    if (!this.canReload() || !this.service()?.setBundleEnabled) { this.phase = 'restart-required'; this.message = '当前 DSH 未提供运行中重载，请升级 DSH 或重启应用。'; return; }
+    if (this.busy()) { this.phase = 'waiting'; this.message = '新版本已安装，等待当前请求和账号操作结束后自动生效。'; this.schedule(1000); return; }
+    const root = join(dir, 'node_modules/dsh-multi-router');
+    try {
+      const patch = parse(await readFile(join(root, 'cordis.patch.yml'), 'utf8'));
+      const row = Array.isArray(patch) && patch.flatMap(p => p?.insert ?? []).find(e => e?.id === `llm-multi-router-v2-${installed.version}`);
+      if (row?.name !== `./lib/host-v${installed.version}.js` || row.disabled) throw Error('legacy entry');
+      await readFile(join(root, `lib/host-v${installed.version}.js`));
+    } catch { this.phase = 'restart-required'; this.message = '安装版本缺少版本化入口，重新安装最新版后再试。'; return; }
+    if (this.now() < this.retryAt) return;
+    this.phase = 'reloading'; this.message = '正在重新加载插件与配置面板…'; this.retryAt = this.now() + 60000;
+    try {
+      // This call disposes this plugin. Its disposer must not await this task;
+      // own update jobs must already have persisted and settled before entering.
+      const result = await outsideActivation(this.hmr(), () => this.service().setBundleEnabled('dsh-multi-router', true));
+      if (this.closed) return;
+      this.phase = 'restart-required';
+      this.message = result.application === 'applied' ? 'DSH 尚未切换到新版本，请重新加载插件或查看组件错误。' : 'DSH 未能重载插件，请升级 DSH 或重启应用。';
+    } catch { if (!this.closed) { this.phase = 'failed'; this.message = '插件重载未完成，可稍后重试；已保存的配置保持不变。'; } }
+  }
+}
