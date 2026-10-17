@@ -1,13 +1,51 @@
-# DSH Multi Router
+# DSH Multi Router · Intl
+
+> WorkBuddy (CN + AI international), Trae, and Qoder routing for DeepSeek Harness — **with working international chat**.
+
+[![npm](https://img.shields.io/npm/v/dsh-multi-router)](https://www.npmjs.com/package/dsh-multi-router)
+[![license](https://img.shields.io/badge/license-MIT-green)](./LICENSE)
+
+## The international chat bug
+
+Upstream dsh-multi-router ships with international (`workbuddy-ai`, `www.workbuddy.ai`) support **in the UI and in the catalog**, but every international chat turn returns **HTTP 400 with an empty body**.
+
+**Root cause:** the global gateway requires three `X-Conversation-*` headers on chat requests. The vendored transport builds only the CN header set, so the gateway rejects the request before it ever reaches a model.
+
+**Fix:** `conversationHeaders()` now supplies a per-turn UUID triple, injected only for the global region. Two call sites (`chatStream` and `probeEffort`) pass the region flag through.
+
+Verified on Windows with DSH 0.2.0-rc.2 — 7 models across both regions, including `gpt-6-luna`, `gemini-3.8-flash`, `grok-4.7`, `deepseek-v4.1-flash-sg`.
+
+## Attribution
+
+This is a standalone project. Its transport layer builds on the MIT-licensed work of the following authors, and this repository keeps their copyright notices:
+
+| Project | Author | License |
+| --- | --- | --- |
+| [`dsh-multi-router`](https://github.com/AndroidSix/dsh-multi-router) | AndroidSix | MIT |
+| [`dsh-workbuddy-connect`](https://github.com/corrinehu/dsh-workbuddy-connect) | Corrine Hu | MIT |
+| [`dsh-connect-trae`](https://github.com/dingminhua/dsh-connect-trae) | LaoDing | MIT |
+| [`dsh-qoder-connect`](https://github.com/masknull/dsh-qoder-connect) | Corrine Hu | MIT |
+
+The international-chat fix described above was contributed back upstream as [PR #2](https://github.com/AndroidSix/dsh-multi-router/pull/2). If it is merged and released, prefer the official package.
+
+See [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md) for the full license texts.
+
+## Install
+
+```bash
+# Desktop profile
+dsh plugin --profile desktop add github:YGtemple/dsh-multi-router-intl
+```
+
+The package name stays `dsh-multi-router` on purpose: DSH resolves the plugin by package name, so renaming it would break loading. Only the source repository differs.
+
+Requires the build step (`npm ci && npm run build`), since `lib/` is not committed.
 
 > ⚠️ **仅供个人学习、研究和技术交流使用。** 本项目与 WorkBuddy / Trae / Qoder / DeepSeek 官方无任何关联，不内置任何账号或凭证。解析客户端本地登录态或调用平台未公开接口**可能违反上游服务条款**，使用前请务必阅读 [免责声明](./DISCLAIMER.md)。
 >
 > **For personal study and research only.** Not affiliated with any vendor. See [DISCLAIMER.md](./DISCLAIMER.md).
 
-一个插件内置 WorkBuddy、Trae、Qoder 的认证、模型发现和聊天传输，提供三家的多账号池及集中路由。运行不依赖原来三个 DSH 插件；三家代码随安装包一起打包。基于 MIT 上游，固定版本见 `upstream-lock.json`，许可见 `THIRD_PARTY_NOTICES.md`。
-
-版本：0.6.4。适配 DSH Desktop / Web 0.2.0-rc.2，Node.js ^22.19.0 或 >=24。
-
+---
 ## 在 DSH 里管理
 
 打开 **插件 → dsh-multi-router 的配置页**。默认进入总览，九个页签：
